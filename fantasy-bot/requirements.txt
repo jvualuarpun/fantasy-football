@@ -3,3 +3,4 @@ python-dotenv
 espn-api
 openai
 httpx
+tzdata

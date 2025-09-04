@@ -4,6 +4,20 @@ from zoneinfo import ZoneInfo
 
 import discord
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+def _start_keepalive():
+    port = int(os.getenv("PORT", "10000"))
+    srv = HTTPServer(("0.0.0.0", port), _Health)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"[WEB] Health server listening on :{port}")
 logging.basicConfig(level=logging.INFO)
 from discord import app_commands
 from discord.ext import tasks
@@ -550,9 +564,11 @@ async def on_ready():
     print("======== READY ==========")
 
 if __name__ == "__main__":
+    _start_keepalive()  # start tiny HTTP server for Render Web Service
     print("[BOOT] Calling bot.run() ...")
     try:
         bot.run(DISCORD_TOKEN)
+
     except Exception as e:
         import traceback
         traceback.print_exc()

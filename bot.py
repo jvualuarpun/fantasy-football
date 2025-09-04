@@ -31,8 +31,19 @@ else:
 BOT_TOKEN = os.getenv("DISCORD_TOKEN", "REPLACE_ME")
 
 # -------- ESPN config --------
-LEAGUE_ID = os.getenv("LEAGUE_ID")
-YEAR = int(os.getenv("YEAR", "2025"))
+def _getenv_str(name: str) -> Optional[str]:
+    """Normalize env strings: strip whitespace; map '', 'none', 'null' -> None."""
+    v = os.getenv(name)
+    if v is None:
+        return None
+    v = str(v).strip()
+    if v == "" or v.lower() in ("none", "null"):
+        return None
+    return v
+
+LEAGUE_ID = _getenv_str("LEAGUE_ID")
+YEAR = int(_getenv_str("YEAR") or "2025")
+# Public league mode: cookies not needed
 ESPN_S2 = None
 SWID = None
 
@@ -75,7 +86,6 @@ def _league_ready() -> Tuple[bool, Optional[str]]:
         return False, "Missing LEAGUE_ID env variable."
     return True, None
 
-
 def _safe_str(x) -> str:
     try:
         return str(x)
@@ -88,7 +98,7 @@ async def refresh_snapshot(force: bool = False) -> None:
     if not ok:
         logger.warning("League not ready: %s", why)
         return
-    now = dt.datetime.utcnow().isoformat()
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
     try:
         lg = League(league_id=int(LEAGUE_ID), year=YEAR)
 
@@ -167,7 +177,7 @@ def compute_team_projection(team: dict) -> float:
     flex_pool = []
     for pid in pid_list:
         p = LEAGUE_SNAPSHOT["players"].get(pid)
-        if not p: 
+        if not p:
             continue
         pos = (p.get("position") or "").upper()
         proj = float(p.get("projections") or 0.0)
@@ -283,8 +293,6 @@ class FantasyBot(commands.Bot):
             logger.info(f"✅ Global slash commands synced ({len(commands)}): {[c.name for c in commands]}")
         except Exception as e:
             logger.exception("❌ Failed to sync global commands: %s", e)
-
-
 
 bot = FantasyBot()
 
@@ -434,15 +442,15 @@ async def grades(interaction: discord.Interaction):
         await interaction.response.send_message("No league data available.")
         return
     totals = [r[2] for r in results]
-    mean, sd = sum(totals)/len(totals), (sum((x - (sum(totals)/len(totals)))**2 for x in totals)/max(1,len(totals)-1))**0.5
+    mean = sum(totals) / len(totals)
+    sd = (sum((x - mean) ** 2 for x in totals) / max(1, len(totals) - 1)) ** 0.5
     lines = ["**Roster Grades**"]
     for name, breakdown, total in sorted(results, key=lambda x: x[2], reverse=True):
-        z = (total - mean)/sd if sd else 0
+        z = (total - mean) / sd if sd else 0
         grade = grade_from_zscore(z)
-        parts = ", ".join([f"{k}:{v:.1f}" for k,v in breakdown.items()])
+        parts = ", ".join([f"{k}:{v:.1f}" for k, v in breakdown.items()])
         lines.append(f"- **{name}** → {grade} (proj {total:.1f}, z={z:+.2f}) [{parts}]")
     await interaction.response.send_message("\n".join(lines))
-
 
 # Alias for /grades
 @app_commands.command(name="draft_grades", description="Alias of /grades.")
@@ -470,28 +478,28 @@ async def projections(interaction: discord.Interaction):
         lines.append(f"- {name}: {v:.1f}")
     await interaction.response.send_message(join_lines(lines))
 
-# /recap and alias /weekly_report (placeholder stubs; can wire box score parsing later)
-@bot.tree.command(name="recap", description="Alias of /weekly_report.")
-async def recap(interaction: discord.Interaction):
-    await interaction.response.send_message("Weekly recap will be implemented with box score parsing.")
-
-@bot.tree.command(name="weekly_report", description="Weekly report.")
-async def weekly_report(interaction: discord.Interaction):
-    await recap.callback(interaction)
+# Optional: quick status command for debugging
+@bot.tree.command(name="status", description="Show ESPN connection status & snapshot info.")
+async def status(interaction: discord.Interaction):
+    ready, why = _league_ready()
+    lines = [
+        f"League ID: {LEAGUE_ID or 'missing'} | Year: {YEAR}",
+        f"Snapshot last refresh: {LEAGUE_SNAPSHOT['meta'].get('last_refresh', 'never')}",
+        f"Ready: {'yes' if ready else 'no'}{f' — {why}' if not ready else ''}",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 # -------- Background: live refresh --------
 @tasks.loop(minutes=10)
 async def auto_refresh_snapshot():
     """Refresh ESPN data every 10m on game days, every 2h otherwise."""
-    dow = dt.datetime.utcnow().weekday()  # Monday=0, Sunday=6
-    # Tue (1), Wed (2), Fri (4), Sat (5) → only refresh every 2 hours
+    now = dt.datetime.now(dt.timezone.utc)
+    dow = now.weekday()  # Monday=0, Sunday=6
+    # Tue (1), Wed (2), Fri (4), Sat (5) → only refresh at even hours
     if dow in (1, 2, 4, 5):
-        now = dt.datetime.utcnow()
-        # Only refresh at even hours (0:00, 2:00, 4:00, etc.)
         if now.hour % 2 != 0:
             return
     await refresh_snapshot()
-
 
 @auto_refresh_snapshot.before_loop
 async def before_auto_refresh():
@@ -500,7 +508,7 @@ async def before_auto_refresh():
 # Provide a default heartbeat too
 @tasks.loop(minutes=30)
 async def heartbeat():
-    logger.info("Heartbeat: bot alive at %s", dt.datetime.utcnow().isoformat())
+    logger.info("Heartbeat: bot alive at %s", dt.datetime.now(dt.timezone.utc).isoformat())
 
 @heartbeat.before_loop
 async def before_heartbeat():
@@ -510,6 +518,7 @@ async def before_heartbeat():
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
+    logger.info("Config check: LEAGUE_ID=%r YEAR=%s", LEAGUE_ID, YEAR)
 
     if not heartbeat.is_running():
         heartbeat.start()
@@ -525,7 +534,6 @@ async def on_ready():
         logger.info(f"🔎 Slash commands loaded ({len(commands)}): {[c.name for c in commands]}")
     except Exception as e:
         logger.exception("❌ Failed to fetch commands: %s", e)
-
 
 if __name__ == "__main__":
     if BOT_TOKEN == "REPLACE_ME":

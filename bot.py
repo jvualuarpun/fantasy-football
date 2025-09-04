@@ -275,13 +275,14 @@ class FantasyBot(commands.Bot):
         self.assistant = DiscordOpenAIInterface()
 
     async def setup_hook(self) -> None:
-    try:
-        # Force global sync (guild=None ensures it's global only)
-        commands = await self.tree.sync(guild=None)
-        self.synced = True
-        logger.info(f"✅ Global slash commands synced ({len(commands)}): {[c.name for c in commands]}")
-    except Exception as e:
-        logger.exception("❌ Failed to sync global commands: %s", e)
+        try:
+            # Force global sync (guild=None ensures it's global only)
+            commands = await self.tree.sync(guild=None)
+            self.synced = True
+            logger.info(f"✅ Global slash commands synced ({len(commands)}): {[c.name for c in commands]}")
+        except Exception as e:
+            logger.exception("❌ Failed to sync global commands: %s", e)
+
 
 
 bot = FantasyBot()

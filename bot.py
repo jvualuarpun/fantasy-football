@@ -29,6 +29,19 @@ import httpx
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# --- Render keep-alive HTTP server for Web Service ---
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+def _start_keepalive():
+    port = int(os.getenv("PORT", "10000"))
+    srv = HTTPServer(("0.0.0.0", port), _Health)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"[WEB] Health server listening on :{port}")
+
 # --------------------- Load config ---------------------
 dotenv_file = Path(__file__).with_name('.env')
 print(f"[ENV] Loading {dotenv_file} exists={dotenv_file.exists()}")
@@ -156,7 +169,7 @@ async def help_cmd(interaction: discord.Interaction):
 
 @tree.command(name="standings", description="Show current standings")
 async def standings(interaction: discord.Interaction):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
     try:
         l = league()
         teams = sorted(l.teams, key=lambda t: t.standing)
@@ -168,7 +181,7 @@ async def standings(interaction: discord.Interaction):
 
 @tree.command(name="weekly_report", description="AI recap for a week (e.g., /weekly_report 3)")
 async def weekly_report_cmd(interaction: discord.Interaction, week: int):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
     try:
         l = league()
         sb = l.scoreboard(week=week)
@@ -182,7 +195,7 @@ async def weekly_report_cmd(interaction: discord.Interaction, week: int):
 
 @tree.command(name="matchup", description="Show a matchup for a team and week")
 async def matchup(interaction: discord.Interaction, team_name: str, week: int):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
     try:
         l = league()
         sb = l.scoreboard(week=week)
@@ -210,7 +223,7 @@ async def matchup(interaction: discord.Interaction, team_name: str, week: int):
 
 @tree.command(name="projections", description="All matchups with projections for a week")
 async def projections(interaction: discord.Interaction, week: int):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
     try:
         l = league()
         sb = l.scoreboard(week=week)
@@ -235,7 +248,7 @@ async def projections(interaction: discord.Interaction, week: int):
 
 @tree.command(name="team", description="Show a team's card (record, PF/PA, rank)")
 async def team_card(interaction: discord.Interaction, team_name: str):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
     try:
         l = league()
         t = find_team(l, team_name)
@@ -251,7 +264,7 @@ async def team_card(interaction: discord.Interaction, team_name: str):
 
 @tree.command(name="injuries", description="Show injuries (all teams or filter by team)")
 async def injuries_cmd(interaction: discord.Interaction, team_name: Optional[str] = None):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
     try:
         l = league()
         teams = [find_team(l, team_name)] if team_name else l.teams
@@ -279,7 +292,7 @@ async def injuries_cmd(interaction: discord.Interaction, team_name: Optional[str
 
 @tree.command(name="power_ranks", description="Simple power rankings (wins + points for)")
 async def power_ranks(interaction: discord.Interaction):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
     try:
         l = league()
         rankings = []
@@ -296,7 +309,7 @@ async def power_ranks(interaction: discord.Interaction):
 
 @tree.command(name="player", description="Look up a player on rosters + free agents (top 256)")
 async def player_lookup(interaction: discord.Interaction, player_name: str):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
     try:
         l = league()
         q = player_name.lower().strip()
@@ -341,7 +354,8 @@ async def player_lookup(interaction: discord.Interaction, player_name: str):
 
 @tree.command(name="ask", description="Ask ChatGPT anything (league-aware)")
 async def ask(interaction: discord.Interaction, prompt: str):
-    await interaction.response.defer()
+    await interaction.response.defer(thinking=True)
+
     try:
         context = league_context()
         resp = await ai.responses.create(
@@ -372,6 +386,18 @@ async def ask(interaction: discord.Interaction, prompt: str):
         await interaction.followup.send(msg)
     except Exception as e:
         await interaction.followup.send(f"Error: `{e}`")
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    try:
+        msg = f"Sorry, something went wrong: `{type(error).__name__}` — {error}"
+        if not interaction.response.is_done():
+            await interaction.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+    except Exception as e:
+        print("[CMD ERROR]", error, "| while reporting:", e)
+
 
 # --------------------- Background tasks ----------------
 async def post_to_channel(text: str):

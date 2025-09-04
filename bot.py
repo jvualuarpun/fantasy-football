@@ -24,21 +24,13 @@ logger = logging.getLogger("fantasy-bot")
 
 # -------- Discord / Bot config --------
 INTENTS = discord.Intents.default()
-# Slash commands still work either way; message memory (on_message) needs Message Content intent:
 ALLOW_MESSAGE_MEMORY = os.getenv("ALLOW_MESSAGE_MEMORY", "false").lower() == "true"
-if ALLOW_MESSAGE_MEMORY:
-    INTENTS.message_content = True
-else:
-    INTENTS.message_content = False
+INTENTS.message_content = True if ALLOW_MESSAGE_MEMORY else False
 
 BOT_TOKEN = os.getenv("DISCORD_TOKEN", "REPLACE_ME")
 
-# Force per-guild sync (for instant updates) while keeping global-only as source of truth.
-FORCE_GUILD_ID = int(os.getenv("FORCE_GUILD_ID", "0") or 0)
-
-# -------- ESPN config --------
+# -------- ESPN config (public league-friendly) --------
 def _getenv_str(name: str) -> Optional[str]:
-    """Normalize env strings: strip whitespace; map '', 'none', 'null' -> None."""
     v = os.getenv(name)
     if v is None:
         return None
@@ -48,7 +40,7 @@ def _getenv_str(name: str) -> Optional[str]:
     return v
 
 def _detect_league_id() -> Optional[str]:
-    """Find LEAGUE_ID from multiple env names or parse it from a league URL."""
+    # Try a few common names, then parse from URL
     for key in ("LEAGUE_ID", "ESPN_LEAGUE_ID", "LEAGUEID"):
         v = _getenv_str(key)
         if v and v.isdigit():
@@ -67,7 +59,6 @@ def _detect_league_id() -> Optional[str]:
     return None
 
 def _detect_year(default_year: str = "2025") -> int:
-    """Pick YEAR; prefer explicit env, else parse seasonId from URL, else default."""
     y = _getenv_str("YEAR")
     if y and y.isdigit():
         return int(y)
@@ -86,6 +77,7 @@ def _detect_year(default_year: str = "2025") -> int:
 
 LEAGUE_ID = _detect_league_id()
 YEAR = _detect_year("2025")
+
 # Public league mode: cookies not needed
 ESPN_S2 = None
 SWID = None
@@ -135,6 +127,59 @@ def _safe_str(x) -> str:
     except Exception:
         return "?"
 
+def _norm_slot_to_pos(slot: Optional[str]) -> Optional[str]:
+    """Map ESPN slot labels to our fixed positions."""
+    if not slot:
+        return None
+    s = slot.upper()
+    if "QB" in s: return "QB"
+    if "RB" in s and "WR" not in s: return "RB"
+    if "WR" in s and "RB" not in s: return "WR"
+    if "TE" in s: return "TE"
+    if "K" == s or "PK" in s: return "K"
+    # Ignore DST/DEF since lineup spec excludes it
+    return None
+
+async def _fill_weekly_projections(lg, players_map: Dict[str, dict]) -> None:
+    """Populate projections via box scores (most reliable)."""
+    try:
+        week = getattr(lg, "current_week", None)
+        if not week:
+            # Fallback heuristic: try 1 if pre-season, or 17 if late season
+            week = 1
+        boxscores = lg.box_scores(week=week)
+        updated = 0
+        for bs in boxscores:
+            for side in ("home_lineup", "away_lineup"):
+                lineup = getattr(bs, side, []) or []
+                for bp in lineup:
+                    pid = _safe_str(getattr(bp, "playerId", None))
+                    proj = getattr(bp, "projected_points", None)
+                    slot = _norm_slot_to_pos(getattr(bp, "slot_position", None))
+                    if not pid:
+                        continue
+                    if pid not in players_map:
+                        # Create a minimal entry if not present
+                        players_map[pid] = {
+                            "name": getattr(getattr(bp, "player", None), "name", f"Player {pid}"),
+                            "team": getattr(getattr(bp, "player", None), "proTeamAbbreviation", "") or "",
+                            "position": slot or "",
+                            "projections": 0.0,
+                        }
+                    if proj is None:
+                        # last resort fallbacks on some installs
+                        proj = getattr(bp, "projected_total_points", None)
+                    if isinstance(proj, (int, float)):
+                        if float(proj) > float(players_map[pid].get("projections") or 0.0):
+                            players_map[pid]["projections"] = float(proj)
+                            updated += 1
+                    # If we learned a better position, keep it
+                    if slot and not players_map[pid].get("position"):
+                        players_map[pid]["position"] = slot
+        logger.info("Filled weekly projections for %s players (week=%s)", updated, week)
+    except Exception as e:
+        logger.info("Box score projections not available: %s", e)
+
 async def refresh_snapshot(force: bool = False) -> None:
     """Populate LEAGUE_SNAPSHOT from ESPN API."""
     ok, why = _league_ready()
@@ -157,19 +202,23 @@ async def refresh_snapshot(force: bool = False) -> None:
                 pid = _safe_str(getattr(p, "playerId", None) or getattr(p, "id", None) or getattr(p, "name", ""))
                 team_abbrev = getattr(p, "proTeam", "") or getattr(p, "proTeamAbbreviation", "") or ""
                 pos = getattr(p, "position", "") or (getattr(p, "eligibleSlots", [""])[0] if getattr(p, "eligibleSlots", None) else "")
-                proj = 0.0
-                try:
-                    stats = getattr(p, "stats", []) or []
-                    for s in stats:
-                        if getattr(s, "projected_points", None) is not None:
-                            proj = float(s.projected_points)
+                # initial projection attempts (will be overwritten by boxscore fill)
+                proj = None
+                # common fallbacks across espn_api versions
+                for attr in ("projected_points", "projected_total_points", "avg_points", "points"):
+                    if hasattr(p, attr):
+                        val = getattr(p, attr)
+                        if isinstance(val, (int, float)):
+                            proj = float(val)
                             break
-                except Exception:
-                    pass
-                players_map[pid] = {"name": getattr(p, "name", f"Player {pid}"),
-                                    "team": team_abbrev,
-                                    "position": pos,
-                                    "projections": proj}
+                if proj is None:
+                    proj = 0.0
+                players_map[pid] = {
+                    "name": getattr(p, "name", f"Player {pid}"),
+                    "team": team_abbrev,
+                    "position": (pos or "").upper(),
+                    "projections": proj,
+                }
                 roster_ids.append(pid)
             teams_map[str(team_id)] = {"name": team_name, "manager": _safe_str(manager), "players": roster_ids}
 
@@ -189,11 +238,14 @@ async def refresh_snapshot(force: bool = False) -> None:
         except Exception as e:
             logger.info("Draft not available: %s", e)
 
+        # Strong projection fill from the current week box scores
+        await _fill_weekly_projections(lg, players_map)
+
         LEAGUE_SNAPSHOT["teams"] = teams_map
         LEAGUE_SNAPSHOT["players"] = players_map
         LEAGUE_SNAPSHOT["draft"] = draft_list
         LEAGUE_SNAPSHOT["meta"]["last_refresh"] = now
-        logger.info("League snapshot refreshed at %s", now)
+        logger.info("League snapshot refreshed at %s (teams=%d, players=%d)", now, len(teams_map), len(players_map))
     except Exception as e:
         logger.exception("Failed to refresh league snapshot: %s", e)
 
@@ -240,6 +292,33 @@ def compute_team_projection(team: dict) -> float:
         total += sum(flex_pool[:flex_need])
     return total
 
+def compute_team_breakdown(team: dict) -> Dict[str, float]:
+    """Return projected points by slot (QB, RB, WR, TE, FLEX, K)."""
+    lineup = LEAGUE_SNAPSHOT.get("lineup", {})
+    pid_list = team.get("players", [])
+    pos_map = {"QB": [], "RB": [], "WR": [], "TE": [], "K": []}
+    flex_pool = []
+    for pid in pid_list:
+        p = LEAGUE_SNAPSHOT["players"].get(pid)
+        if not p:
+            continue
+        pos = (p.get("position") or "").upper()
+        proj = float(p.get("projections") or 0.0)
+        if pos in pos_map:
+            pos_map[pos].append(proj)
+        if pos in ("RB", "WR", "TE"):
+            flex_pool.append(proj)
+    breakdown = {}
+    for pos, need in lineup.items():
+        if pos == "FLEX":
+            continue
+        vals = sorted(pos_map.get(pos, []), reverse=True)
+        breakdown[pos] = sum(vals[:int(need or 0)])
+    if lineup.get("FLEX", 0):
+        flex_pool.sort(reverse=True)
+        breakdown["FLEX"] = sum(flex_pool[: int(lineup["FLEX"])])
+    return breakdown
+
 def compute_grades() -> List[Tuple[str, float, float, str]]:
     totals = []
     for team_id, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
@@ -256,12 +335,8 @@ def compute_grades() -> List[Tuple[str, float, float, str]]:
         out.append((name, v, z, grade_from_zscore(z)))
     return out
 
-# ---------- OpenAI Assistant Memory (Threads API with queue+lock) ----------
+# ---------- OpenAI Assistant Memory ----------
 class DiscordOpenAIInterface:
-    """
-    Remembers messages by pushing them into an OpenAI Thread and replies when bot is mentioned.
-    Uses an asyncio Queue + Lock to avoid runs being executed against the wrong latest message.
-    """
     def __init__(self):
         self.enabled = bool(OpenAI_AVAILABLE and OPENAI_API_KEY and OPENAI_ASSISTANT_ID and OPENAI_THREAD_ID)
         self.client = AsyncOpenAI(api_key=OPENAI_API_KEY) if self.enabled else None
@@ -318,7 +393,7 @@ class DiscordOpenAIInterface:
                 logger.exception("OpenAI run failed: %s", e)
                 return "(assistant error)"
 
-# ---------- Tiny HTTP health server (for Render Web Service) ----------
+# ---------- Tiny HTTP health server (Render) ----------
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
     class Handler(BaseHTTPRequestHandler):
@@ -332,7 +407,6 @@ def start_health_server():
                 self.send_response(404)
                 self.end_headers()
         def log_message(self, fmt, *args):
-            # Silence default HTTP server logging
             return
     server = HTTPServer(("0.0.0.0", port), Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
@@ -349,24 +423,16 @@ class FantasyBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         try:
-            # (Optional) Instant per-guild sync for your server, sourced from the global tree
-            if FORCE_GUILD_ID:
-                guild_obj = discord.Object(id=FORCE_GUILD_ID)
-                # Copy current global command definitions into the guild scope for instant availability
-                self.tree.copy_global_to(guild=guild_obj)
-                gcmds = await self.tree.sync(guild=guild_obj)
-                logger.info("✅ Guild commands synced to %s (%d): %s", FORCE_GUILD_ID, len(gcmds), [c.name for c in gcmds])
-
-            # Always sync globals (authoritative)
-            gc = await self.tree.sync(guild=None)
+            # Force global sync (guild=None ensures it's global only)
+            commands_list = await self.tree.sync(guild=None)
             self.synced = True
-            logger.info("✅ Global slash commands synced (%d): %s", len(gc), [c.name for c in gc])
+            logger.info(f"✅ Global slash commands synced ({len(commands_list)}): {[c.name for c in commands_list]}")
         except Exception as e:
-            logger.exception("❌ Failed to sync application commands: %s", e)
+            logger.exception("❌ Failed to sync global commands: %s", e)
 
 bot = FantasyBot()
 
-# ------ Optional memory over regular messages (requires ALLOW_MESSAGE_MEMORY=true) ------
+# ------ Optional message memory ------
 @bot.event
 async def on_message(message: discord.Message):
     if not ALLOW_MESSAGE_MEMORY:
@@ -397,60 +463,118 @@ def join_lines(lines: List[str]) -> str:
 @app_commands.default_permissions(manage_guild=True)
 async def sync_cleanup(interaction: discord.Interaction):
     try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await bot.tree.sync(guild=None)  # globals authoritative
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=ok_embed("Sync Cleanup", "Global commands re-synced. Stale guild commands should clear shortly."),
             ephemeral=True
         )
     except Exception as e:
-        await interaction.response.send_message(embed=err_embed(f"Sync failed: {e}"), ephemeral=True)
-
-@bot.tree.command(name="resync", description="Force re-sync commands (Manage Server).")
-@app_commands.default_permissions(manage_guild=True)
-async def resync(interaction: discord.Interaction):
-    try:
-        # Re-sync global
-        gc = await bot.tree.sync(guild=None)
-        msgs = [f"Global synced ({len(gc)})"]
-
-        # Re-sync guild (instant) if enabled
-        if FORCE_GUILD_ID:
-            guild_obj = discord.Object(id=FORCE_GUILD_ID)
-            bot.tree.copy_global_to(guild=guild_obj)
-            gcmds = await bot.tree.sync(guild=guild_obj)
-            msgs.append(f"Guild {FORCE_GUILD_ID} synced ({len(gcmds)})")
-
-        await interaction.response.send_message(" / ".join(msgs), ephemeral=True)
-        logger.info("Manual resync done: %s", " / ".join(msgs))
-    except Exception as e:
-        logger.exception("Manual resync failed: %s", e)
-        await interaction.response.send_message(f"Resync failed: {e}", ephemeral=True)
+        await interaction.followup.send(embed=err_embed(f"Sync failed: {e}"), ephemeral=True)
 
 @bot.tree.command(name="ask", description="Ask something (league-aware).")
 @app_commands.describe(question="Your question")
 async def ask(interaction: discord.Interaction, question: str):
-    lineup_info = format_lineup_counts(LEAGUE_SNAPSHOT)
+    await interaction.response.defer(thinking=True)
+    await refresh_snapshot()
+
+    # Helper: compute projections league-wide
+    totals = []
+    for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
+        totals.append((t.get("name", f"Team {tid}"), compute_team_projection(t)))
+    totals = [(n, float(v)) for (n, v) in totals]
+    totals.sort(key=lambda x: x[1], reverse=True)
+
+    # If we have no teams or no projections, tell the user what's up
+    if not totals:
+        await interaction.followup.send(
+            "I don't have league data yet. Make sure **LEAGUE_ID** (or **LEAGUE_URL**) is set and the league is public."
+        )
+        return
+
+    qlow = question.lower()
+    wants_rankings = any(
+        k in qlow
+        for k in (
+            "who is going to win",
+            "who's going to win",
+            "who will win",
+            "prediction",
+            "predictions",
+            "top 3",
+            "top three",
+            "power rank",
+            "rank the teams",
+        )
+    )
+
+    # If the question smells like a prediction request, answer directly from projections
+    if wants_rankings:
+        top_n = 3
+        top = totals[:top_n]
+        if all(v == 0.0 for (_, v) in top):
+            await interaction.followup.send(
+                "Projections for this scoring period aren't available yet from ESPN. Try again later, or use **/roster**."
+            )
+            return
+
+        lines = [f"**Top {len(top)} by projected starting lineup**"]
+        for i, (name, pts) in enumerate(top, start=1):
+            lines.append(f"{i}. **{name}** — {pts:.1f} projected")
+        lines.append(f"Snapshot: {LEAGUE_SNAPSHOT['meta'].get('last_refresh','never')}")
+        await interaction.followup.send("\n".join(lines))
+        return
+
+    # Otherwise, if Assistant is configured, let it answer with league context
+    if bot.assistant.enabled:
+        # Compact league summary the assistant can use
+        lineup_info = ", ".join(f"{k}:{v}" for k, v in LEAGUE_SNAPSHOT.get("lineup", {}).items())
+        top_preview = "\n".join(f"- {name}: {pts:.1f}" for name, pts in totals[:8])
+        context = (
+            "League snapshot context:\n"
+            f"Lineup counts → {lineup_info}\n"
+            "Top teams by projected starting lineup:\n"
+            f"{top_preview}\n"
+            "Answer the user's question using this context. If the question asks for predictions, "
+            "reference the projected totals."
+        )
+
+        # Push context + user question, then get reply
+        await bot.assistant.add_to_thread(context, role="system")
+        await bot.assistant.add_to_thread(question, role="user")
+        reply = await bot.assistant.get_reply()
+        await interaction.followup.send(reply)
+        return
+
+    # Fallback if Assistant is not configured
+    lineup_info = "\n".join(f"{k}: {v}" for k, v in LEAGUE_SNAPSHOT.get("lineup", {}).items())
     lines = [
         f"**Q:** {question}",
-        "**League Lineup (fixed counts):**",
+        "**Top 5 by projected starting lineup:**",
+        *(f"- {name}: {pts:.1f}" for name, pts in totals[:5]),
+        "",
+        "**Lineup (fixed counts):**",
         lineup_info,
-        "—",
-        f"Snapshot last refresh: {LEAGUE_SNAPSHOT['meta'].get('last_refresh', 'never')}",
+        f"Snapshot: {LEAGUE_SNAPSHOT['meta'].get('last_refresh','never')}",
+        "",
+        "_Tip: ask '**who will win**' or '**top 3 predictions**' to get ranked picks._",
     ]
-    await interaction.response.send_message(join_lines(lines))
+    await interaction.followup.send("\n".join(lines))
+
 
 @bot.tree.command(name="roster", description="Show a team's roster.")
 @app_commands.describe(team="Team name or manager (partial ok)")
 async def roster(interaction: discord.Interaction, team: str):
+    await interaction.response.defer(thinking=True)
     await refresh_snapshot()
     match_team_id = None
     tlower = team.lower()
     for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
-        if tlower in t.get("name", "").lower() or tlower in t.get("manager", "").lower():
+        if tlower in (t.get("name", "") or "").lower() or tlower in (t.get("manager", "") or "").lower():
             match_team_id = tid
             break
     if not match_team_id:
-        await interaction.response.send_message(f"Couldn't find a team matching **{team}**.")
+        await interaction.followup.send(f"Couldn't find a team matching **{team}**.")
         return
     t = LEAGUE_SNAPSHOT["teams"][match_team_id]
     lines = [f"**{t['name']}** (Mgr: {t['manager']})"]
@@ -459,27 +583,29 @@ async def roster(interaction: discord.Interaction, team: str):
         if not p:
             continue
         lines.append(f"- {p['name']} ({p['position']}, {p['team']}) proj: {p['projections']:.2f}")
-    await interaction.response.send_message(join_lines(lines))
+    await interaction.followup.send(join_lines(lines))
 
 @bot.tree.command(name="whohas", description="Find which team has a player.")
 @app_commands.describe(player="Player name (partial ok)")
 async def whohas(interaction: discord.Interaction, player: str):
+    await interaction.response.defer(thinking=True)
     await refresh_snapshot()
     pl = player.lower()
     for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
         for pid in t.get("players", []):
             p = LEAGUE_SNAPSHOT["players"].get(pid, {})
-            if pl in p.get("name", "").lower():
-                await interaction.response.send_message(f"**{p.get('name','?')}** is on **{t.get('name','Team')}**.")
+            if pl in (p.get("name", "") or "").lower():
+                await interaction.followup.send(f"**{p.get('name','?')}** is on **{t.get('name','Team')}**.")
                 return
-    await interaction.response.send_message(f"Couldn't find **{player}** in the snapshot.")
+    await interaction.followup.send(f"Couldn't find **{player}** in the snapshot.")
 
 @bot.tree.command(name="draftboard", description="Show the draft board with player names and team abbrev.")
 async def draftboard(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
     await refresh_snapshot()
     picks = LEAGUE_SNAPSHOT.get("draft", [])
     if not picks:
-        await interaction.response.send_message("No draft data available.")
+        await interaction.followup.send("No draft data available.")
         return
     lines = ["**Draft Board**"]
     for item in sorted(picks, key=lambda x: x.get("pick", 0)):
@@ -487,37 +613,16 @@ async def draftboard(interaction: discord.Interaction):
         p = LEAGUE_SNAPSHOT["players"].get(pid, {"name": f"Player {pid}", "team": ""})
         team_abbrev = f" ({p['team']})" if p.get("team") else ""
         lines.append(f"{item.get('pick', '?')}. **{item.get('team_name', 'Team')}** → {p['name']}{team_abbrev}")
-    await interaction.response.send_message(join_lines(lines))
+    await interaction.followup.send(join_lines(lines))
 
-def compute_team_breakdown(team: dict) -> Dict[str, float]:
-    """Return projected points by slot (QB, RB, WR, TE, FLEX, K)."""
-    lineup = LEAGUE_SNAPSHOT.get("lineup", {})
-    pid_list = team.get("players", [])
-    pos_map = {"QB": [], "RB": [], "WR": [], "TE": [], "K": []}
-    flex_pool = []
-    for pid in pid_list:
-        p = LEAGUE_SNAPSHOT["players"].get(pid)
-        if not p:
-            continue
-        pos = (p.get("position") or "").upper()
-        proj = float(p.get("projections") or 0.0)
-        if pos in pos_map:
-            pos_map[pos].append(proj)
-        if pos in ("RB", "WR", "TE"):
-            flex_pool.append(proj)
-    breakdown = {}
-    for pos, need in lineup.items():
-        if pos == "FLEX":
-            continue
-        vals = sorted(pos_map.get(pos, []), reverse=True)
-        breakdown[pos] = sum(vals[:int(need or 0)])
-    if lineup.get("FLEX", 0):
-        flex_pool.sort(reverse=True)
-        breakdown["FLEX"] = sum(flex_pool[: int(lineup["FLEX"])])
-    return breakdown
+# A forgiving alias for typos: /draftboards
+@bot.tree.command(name="draftboards", description="Alias of /draftboard.")
+async def draftboards(interaction: discord.Interaction):
+    await draftboard.callback(interaction)
 
 @bot.tree.command(name="grades", description="Roster grades with slot breakdown.")
 async def grades(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
     await refresh_snapshot()
     results = []
     for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
@@ -525,7 +630,7 @@ async def grades(interaction: discord.Interaction):
         total = sum(breakdown.values())
         results.append((t["name"], breakdown, total))
     if not results:
-        await interaction.response.send_message("No league data available.")
+        await interaction.followup.send("No league data available.")
         return
     totals = [r[2] for r in results]
     mean = sum(totals) / len(totals)
@@ -536,7 +641,7 @@ async def grades(interaction: discord.Interaction):
         grade = grade_from_zscore(z)
         parts = ", ".join([f"{k}:{v:.1f}" for k, v in breakdown.items()])
         lines.append(f"- **{name}** → {grade} (proj {total:.1f}, z={z:+.2f}) [{parts}]")
-    await interaction.response.send_message("\n".join(lines))
+    await interaction.followup.send("\n".join(lines))
 
 # Alias for /grades
 @app_commands.command(name="draft_grades", description="Alias of /grades.")
@@ -544,41 +649,43 @@ async def draft_grades(interaction: discord.Interaction):
     await grades.callback(interaction)
 bot.tree.add_command(draft_grades)
 
-# /proj and alias /projections
 @bot.tree.command(name="proj", description="Alias of /projections.")
 async def proj(interaction: discord.Interaction):
-    await interaction.response.send_message("Use **/grades** or **/roster** for projections by team.")
+    await interaction.response.defer(thinking=True)
+    await interaction.followup.send("Use **/grades** or **/roster** for projections by team.")
 
 @bot.tree.command(name="projections", description="Show team projections league-wide.")
 async def projections(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
     await refresh_snapshot()
     totals = []
     for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
         totals.append((t.get("name", f"Team {tid}"), compute_team_projection(t)))
     if not totals:
-        await interaction.response.send_message("No data available. Check your ESPN credentials.")
+        await interaction.followup.send("No data available. Check your ESPN configuration or if projections are available yet.")
         return
     totals.sort(key=lambda x: x[1], reverse=True)
     lines = ["**Projected Starting Lineup Totals**"]
     for name, v in totals[:12]:
         lines.append(f"- {name}: {v:.1f}")
-    await interaction.response.send_message(join_lines(lines))
+    await interaction.followup.send(join_lines(lines))
 
-# Optional: quick status command for debugging
 @bot.tree.command(name="status", description="Show ESPN connection status & snapshot info.")
 async def status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     ready, why = _league_ready()
     lines = [
         f"League ID: {LEAGUE_ID or 'missing'} | Year: {YEAR}",
         f"Snapshot last refresh: {LEAGUE_SNAPSHOT['meta'].get('last_refresh', 'never')}",
+        f"Teams cached: {len(LEAGUE_SNAPSHOT.get('teams', {}))} | Players cached: {len(LEAGUE_SNAPSHOT.get('players', {}))}",
         f"Ready: {'yes' if ready else 'no'}{f' — {why}' if not ready else ''}",
     ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 # -------- Background: live refresh --------
 @tasks.loop(minutes=10)
 async def auto_refresh_snapshot():
-    """Refresh ESPN data every 10m on game days, every 2h otherwise."""
+    """Refresh ESPN data every 10m on game days, every 2h otherwise (you chose 10m cadence)."""
     now = dt.datetime.now(dt.timezone.utc)
     dow = now.weekday()  # Monday=0, Sunday=6
     # Tue (1), Wed (2), Fri (4), Sat (5) → only refresh at even hours
@@ -591,7 +698,6 @@ async def auto_refresh_snapshot():
 async def before_auto_refresh():
     await bot.wait_until_ready()
 
-# Provide a default heartbeat too
 @tasks.loop(minutes=30)
 async def heartbeat():
     logger.info("Heartbeat: bot alive at %s", dt.datetime.now(dt.timezone.utc).isoformat())
@@ -611,10 +717,8 @@ async def on_ready():
     if not auto_refresh_snapshot.is_running():
         auto_refresh_snapshot.start()
 
-    # Refresh ESPN snapshot immediately
     await refresh_snapshot(force=True)
 
-    # Debug: log which commands are registered
     try:
         commands_list = await bot.tree.fetch_commands()
         logger.info(f"🔎 Slash commands loaded ({len(commands_list)}): {[c.name for c in commands_list]}")
@@ -625,6 +729,5 @@ if __name__ == "__main__":
     if BOT_TOKEN == "REPLACE_ME":
         logger.warning("DISCORD_TOKEN env var not set. Please set it before running.")
     else:
-        # Bind a tiny HTTP server so Render Web Service sees an open port
-        _server = start_health_server()
+        _server = start_health_server()  # bind a port for Render Web Service
         bot.run(BOT_TOKEN)

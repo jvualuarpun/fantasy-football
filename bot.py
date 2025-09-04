@@ -3,50 +3,15 @@ from typing import Optional, List, Dict, Tuple, Set
 from zoneinfo import ZoneInfo
 
 import discord
-import logging
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-def _start_keepalive():
-    port = int(os.getenv("PORT", "10000"))
-    srv = HTTPServer(("0.0.0.0", port), _Health)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"[WEB] Health server listening on :{port}")
-logging.basicConfig(level=logging.INFO)
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
-from pathlib import Path
 from openai import AsyncOpenAI
 from espn_api.football import League
 import httpx
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-# --- Render keep-alive HTTP server for Web Service ---
-class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-def _start_keepalive():
-    port = int(os.getenv("PORT", "10000"))
-    srv = HTTPServer(("0.0.0.0", port), _Health)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"[WEB] Health server listening on :{port}")
 
 # --------------------- Load config ---------------------
-dotenv_file = Path(__file__).with_name('.env')
-print(f"[ENV] Loading {dotenv_file} exists={dotenv_file.exists()}")
-load_dotenv(dotenv_path=dotenv_file, override=True)
-print('[BOOT] Starting fantasy bot...')
+load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -54,26 +19,6 @@ LEAGUE_ID = int(os.getenv("ESPN_LEAGUE_ID"))
 YEAR = int(os.getenv("ESPN_YEAR"))
 SWID = os.getenv("ESPN_SWID")
 S2 = os.getenv("ESPN_S2")
-
-def _validate_env():
-    missing = []
-    def chk(key):
-        val = os.getenv(key)
-        if not val:
-            missing.append(key)
-        return val
-    needed = [
-        "DISCORD_TOKEN", "ESPN_LEAGUE_ID", "ESPN_YEAR",
-        "ESPN_SWID", "ESPN_S2", "ANNOUNCE_CHANNEL_ID"
-    ]
-    for k in needed:
-        chk(k)
-    if missing:
-        print("[ENV] Missing or empty keys:", ", ".join(missing))
-    else:
-        print("[ENV] All required keys present.")
-_validate_env()
-
 
 ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))
 TZ = ZoneInfo("America/Chicago")
@@ -85,9 +30,6 @@ tree = app_commands.CommandTree(bot)
 ai = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 announce_channel: Optional[discord.TextChannel] = None
-
-TASKS_STARTED = False
-SYNCED_GUILDS = set()  # type: set[int]
 
 # --------------------- ESPN helpers --------------------
 def league() -> League:
@@ -131,18 +73,134 @@ async def llm_summary(title: str, bullets: str) -> str:
                 out.append(c.text)
     return ("\n".join(out)).strip() or "No analysis available."
 
-def league_context():
-    """Short snapshot of the league for AI context."""
-    try:
-        l = league()
-        lines = []
-        for t in l.teams:
-            lines.append(
-                f"{t.team_name} (Record {t.wins}-{t.losses}-{t.ties}, PF {t.points_for:.1f})"
-            )
-        return "\n".join(lines)
-    except Exception:
-        return "League data unavailable."
+# --------------------- Draft helpers --------------------
+def _draft_endpoint() -> str:
+    # ESPN endpoint that includes draft details for the league
+    return f"https://fantasy.espn.com/apis/v3/games/ffl/seasons/{YEAR}/segments/0/leagues/{LEAGUE_ID}?view=mDraftDetail"
+
+async def fetch_draft_json() -> dict:
+    # Use cookies so private leagues work
+    async with httpx.AsyncClient(timeout=20) as http:
+        r = await http.get(_draft_endpoint(), cookies={"swid": SWID, "espn_s2": S2})
+        r.raise_for_status()
+        return r.json()
+
+def pick_line(p: dict, team_lookup: Dict[int, str]) -> str:
+    r = p.get("roundId")
+    rp = p.get("roundPickNumber")
+    op = p.get("overallPickNumber")
+    pid = p.get("playerId")
+    t_id = p.get("teamId")
+    name = p.get("playerName") or f"Player {pid}"
+    team_name = team_lookup.get(t_id, f"Team {t_id}")
+    return f"Round {r}, Pick {rp} (#{op}): **{name}** → **{team_name}**"
+
+# --------------------- Projections (kona) helpers --------------------
+def _kona_endpoint() -> str:
+    # Combine views so we have teams, rosters, players, and settings
+    base = f"https://fantasy.espn.com/apis/v3/games/ffl/seasons/{YEAR}/segments/0/leagues/{LEAGUE_ID}"
+    views = ["mTeam", "mRoster", "kona_player_info", "mSettings"]
+    return base + "?" + "&".join([f"view={v}" for v in views])
+
+async def fetch_kona() -> dict:
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.get(_kona_endpoint(), cookies={"swid": SWID, "espn_s2": S2})
+        r.raise_for_status()
+        return r.json()
+
+# Slot category constants used by ESPN
+SLOT_QB = 0
+SLOT_RB = 2
+SLOT_WR = 4
+SLOT_TE = 6
+SLOT_K  = 17
+SLOT_DST = 16
+SLOT_FLEX = 23   # RB/WR/TE
+SLOT_BENCH = 20
+SLOT_IR = 21
+
+FLEX_ELIGIBLE = {SLOT_RB, SLOT_WR, SLOT_TE}
+
+def _extract_player_projections(players: list) -> Dict[int, float]:
+    """Return map of playerId -> projected points (best available projection)."""
+    proj = {}
+    for p in players or []:
+        pl = p.get("player") or {}
+        pid = pl.get("id")
+        best = 0.0
+        for st in pl.get("stats", []):
+            # statSourceId 1 is projections in ESPN; appliedTotal is fantasy points
+            if st.get("statSourceId") == 1:
+                val = float(st.get("appliedTotal") or 0.0)
+                if val > best:
+                    best = val
+        if pid is not None:
+            proj[pid] = best
+    return proj
+
+def _extract_player_meta(players: list):
+    names = {}
+    elig = {}
+    for p in players or []:
+        pl = p.get("player") or {}
+        pid = pl.get("id")
+        nm = (pl.get("fullName") or pl.get("name")) or "Unknown Player"
+        slots = set(pl.get("eligibleSlots") or [])
+        if pid is not None:
+            names[pid] = nm
+            elig[pid] = slots
+    return names, elig
+
+def _extract_rosters_and_slots(data: dict):
+    # Build team rosters as list of playerIds; and slot counts for starting lineup
+    teams = data.get("teams") or []
+    roster_settings = ((data.get("settings") or {}).get("rosterSettings") or {})
+    lineup_counts = {}
+    for sc in roster_settings.get("slotCategoryItems", []):
+        cid = sc.get("slotCategoryId")
+        ct = sc.get("num") or 0
+        lineup_counts[cid] = ct
+    team_rosters = {}
+    for t in teams:
+        tid = t.get("id")
+        roster = []
+        for e in ((t.get("roster") or {}).get("entries") or []):
+            pid = (e.get("playerPoolEntry") or {}).get("id")
+            if pid is not None:
+                roster.append(pid)
+        if tid is not None:
+            team_rosters[tid] = roster
+    team_names = {t.get("id"): (t.get("location","") + " " + t.get("nickname","")).strip() for t in teams}
+    return team_rosters, lineup_counts, team_names
+
+def _pick_best_lineup(roster_pids: list, player_proj: Dict[int, float], player_elig: Dict[int, set], lineup_counts: Dict[int, int]):
+    """Greedy: fill each starting slot with highest projection eligible player, then flex, then compute bench."""
+    remaining = set(roster_pids)
+    starters = []
+    def take_for(slot_id, count):
+        nonlocal remaining, starters
+        for _ in range(count):
+            candidates = [pid for pid in remaining if slot_id in player_elig.get(pid, set())]
+            if not candidates:
+                continue
+            best = max(candidates, key=lambda pid: player_proj.get(pid, 0.0))
+            starters.append(best)
+            remaining.remove(best)
+    # Primary slots
+    for sid in [SLOT_QB, SLOT_RB, SLOT_WR, SLOT_TE, SLOT_DST, SLOT_K]:
+        c = lineup_counts.get(sid, 0)
+        if c:
+            take_for(sid, c)
+    # Flex slots (RB/WR/TE)
+    cflex = lineup_counts.get(SLOT_FLEX, 0)
+    for _ in range(cflex):
+        candidates = [pid for pid in remaining if player_elig.get(pid, set()) & FLEX_ELIGIBLE]
+        if candidates:
+            best = max(candidates, key=lambda pid: player_proj.get(pid, 0.0))
+            starters.append(best)
+            remaining.remove(best)
+    bench = list(remaining)
+    return starters, bench
 
 # --------------------- Caches for alerts ----------------
 SEEN_ACTIVITY_KEYS: Set[str] = set()
@@ -163,13 +221,15 @@ async def help_cmd(interaction: discord.Interaction):
         "• `/power_ranks` — simple power rankings\n"
         "• `/player player_name:<text>` — search rosters + top 256 free agents\n"
         "• `/ask prompt:<text>` — ask ChatGPT anything\n"
+        "• `/draftboard` — draft board by round\n"
+        "• `/draft_grades` — grades based on projections (starters weighted more)\n"
         "\nAutomatic posts: pre-kickoff weekly report (Sun), NFL finals, trades/waivers, injury changes, and Tuesday recap."
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
 @tree.command(name="standings", description="Show current standings")
 async def standings(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     try:
         l = league()
         teams = sorted(l.teams, key=lambda t: t.standing)
@@ -181,7 +241,7 @@ async def standings(interaction: discord.Interaction):
 
 @tree.command(name="weekly_report", description="AI recap for a week (e.g., /weekly_report 3)")
 async def weekly_report_cmd(interaction: discord.Interaction, week: int):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     try:
         l = league()
         sb = l.scoreboard(week=week)
@@ -195,7 +255,7 @@ async def weekly_report_cmd(interaction: discord.Interaction, week: int):
 
 @tree.command(name="matchup", description="Show a matchup for a team and week")
 async def matchup(interaction: discord.Interaction, team_name: str, week: int):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     try:
         l = league()
         sb = l.scoreboard(week=week)
@@ -223,7 +283,7 @@ async def matchup(interaction: discord.Interaction, team_name: str, week: int):
 
 @tree.command(name="projections", description="All matchups with projections for a week")
 async def projections(interaction: discord.Interaction, week: int):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     try:
         l = league()
         sb = l.scoreboard(week=week)
@@ -248,7 +308,7 @@ async def projections(interaction: discord.Interaction, week: int):
 
 @tree.command(name="team", description="Show a team's card (record, PF/PA, rank)")
 async def team_card(interaction: discord.Interaction, team_name: str):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     try:
         l = league()
         t = find_team(l, team_name)
@@ -264,7 +324,7 @@ async def team_card(interaction: discord.Interaction, team_name: str):
 
 @tree.command(name="injuries", description="Show injuries (all teams or filter by team)")
 async def injuries_cmd(interaction: discord.Interaction, team_name: Optional[str] = None):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     try:
         l = league()
         teams = [find_team(l, team_name)] if team_name else l.teams
@@ -292,7 +352,7 @@ async def injuries_cmd(interaction: discord.Interaction, team_name: Optional[str
 
 @tree.command(name="power_ranks", description="Simple power rankings (wins + points for)")
 async def power_ranks(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     try:
         l = league()
         rankings = []
@@ -309,7 +369,7 @@ async def power_ranks(interaction: discord.Interaction):
 
 @tree.command(name="player", description="Look up a player on rosters + free agents (top 256)")
 async def player_lookup(interaction: discord.Interaction, player_name: str):
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     try:
         l = league()
         q = player_name.lower().strip()
@@ -352,52 +412,84 @@ async def player_lookup(interaction: discord.Interaction, player_name: str):
     except Exception as e:
         await interaction.followup.send(f"Error: `{e}`")
 
-@tree.command(name="ask", description="Ask ChatGPT anything (league-aware)")
+@tree.command(name="ask", description="Ask ChatGPT anything")
 async def ask(interaction: discord.Interaction, prompt: str):
-    await interaction.response.defer(thinking=True)
-
+    await interaction.response.defer()
     try:
-        context = league_context()
-        resp = await ai.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an analyst for our fantasy football league. "
-                        "Use the following league context in your reasoning and answers. "
-                        "If the user asks about our league (teams, standings, projections, etc.), "
-                        "refer to this context without asking for team lists.\n"
-                        f"{context}"
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-        )
+        resp = await ai.responses.create(model="gpt-4o-mini", input=[{"role":"user","content":prompt}])
         out = []
         for item in resp.output:
             for c in getattr(item, "content", []):
                 if c.type == "output_text":
                     out.append(c.text)
-        answer = ("\n".join(out)).strip() or "No response."
-        msg = f"**You asked:** {prompt}\n\n**Answer:**\n{answer}"
+        text = ("\n".join(out)).strip() or "No response."
+        if len(text) > 1800:
+            text = text[:1800] + "\n...(truncated)"
+        await interaction.followup.send(text)
+    except Exception as e:
+        await interaction.followup.send(f"Error: `{e}`")
+
+@tree.command(name="draft_grades", description="Grade teams based on ESPN projections (starters weighted)")
+async def draft_grades(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        data = await fetch_kona()
+        players = data.get("players") or []
+        player_proj = _extract_player_projections(players)
+        player_names, player_elig = _extract_player_meta(players)
+        team_rosters, lineup_counts, team_names = _extract_rosters_and_slots(data)
+
+        results = []
+        for tid, roster in team_rosters.items():
+            starters, bench = _pick_best_lineup(roster, player_proj, player_elig, lineup_counts)
+            s_total = sum(player_proj.get(pid, 0.0) for pid in starters)
+            b_total = sum(player_proj.get(pid, 0.0) for pid in bench)
+            score = s_total + 0.3 * b_total
+            results.append((score, s_total, b_total, tid, starters, bench))
+
+        if not results:
+            return await interaction.followup.send("No roster/projection data available yet. Try after your draft completes.")
+
+        results.sort(key=lambda x: x[0], reverse=True)
+        top = results[0][0] or 1.0
+        lines = ["**Draft Grades (ESPN projections, starters weighted 1.0, bench 0.3)**"]
+        for rank, (score, s_total, b_total, tid, starters, bench) in enumerate(results, start=1):
+            pct = (score / top) * 100.0
+            grade = "A+" if pct >= 95 else "A" if pct >= 90 else "A-" if pct >= 85 else "B+" if pct >= 80 else "B" if pct >= 75 else "C" if pct >= 65 else "D"
+            lines.append(f"{rank}. {team_names.get(tid, f'Team {tid}')}: **{grade}** — Score {score:.1f} (Starters {s_total:.1f} | Bench {b_total:.1f})")
+        msg = "\n".join(lines)
         if len(msg) > 1900:
             msg = msg[:1900] + "\n...(truncated)"
         await interaction.followup.send(msg)
     except Exception as e:
         await interaction.followup.send(f"Error: `{e}`")
 
-@tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+@tree.command(name="draftboard", description="Show the draft board (by round)")
+async def draftboard(interaction: discord.Interaction):
+    await interaction.response.defer()
     try:
-        msg = f"Sorry, something went wrong: `{type(error).__name__}` — {error}"
-        if not interaction.response.is_done():
-            await interaction.response.send_message(msg, ephemeral=True)
-        else:
-            await interaction.followup.send(msg, ephemeral=True)
+        data = await fetch_draft_json()
+        dd = (data or {}).get("draftDetail") or {}
+        picks = dd.get("picks") or []
+        if not picks:
+            return await interaction.followup.send("No draft data found yet.")
+        l = league()
+        team_lookup = {t.team_id: t.team_name for t in l.teams}
+        picks.sort(key=lambda x: (x.get("roundId", 0), x.get("roundPickNumber", 0)))
+        lines = []
+        cur_round = None
+        for p in picks:
+            r = p.get("roundId")
+            if r != cur_round:
+                cur_round = r
+                lines.append(f"\n**Round {r}**")
+            lines.append("• " + pick_line(p, team_lookup))
+        msg = "\n".join(lines)
+        if len(msg) > 1900:
+            msg = msg[:1900] + "\n...(truncated)"
+        await interaction.followup.send(msg)
     except Exception as e:
-        print("[CMD ERROR]", error, "| while reporting:", e)
-
+        await interaction.followup.send(f"Error: `{e}`")
 
 # --------------------- Background tasks ----------------
 async def post_to_channel(text: str):
@@ -529,75 +621,22 @@ async def nfl_finals_watch():
         pass
 
 # --------------------- Bot lifecycle -------------------
-async def sync_commands_once_per_guild():
-    """Copy globals and sync slash commands once per guild."""
-    for g in bot.guilds:
-        if g.id in SYNCED_GUILDS:
-            continue
-        try:
-            tree.copy_global_to(guild=g)
-            cmds = await tree.sync(guild=g)
-            print(f"[SYNC] {len(cmds)} cmds -> {g.name} ({g.id})")
-            SYNCED_GUILDS.add(g.id)
-        except Exception as e:
-            print(f"[SYNC ERROR] {g.name} ({g.id}): {e}")
-
-async def start_background_tasks_once():
-    """Start background loops only if not already running."""
-    global TASKS_STARTED
-    if TASKS_STARTED:
-        print("[TASKS] Already started; skipping.")
-        return
-
-    loop_names = [
-        "transactions_watch",
-        "injury_watch",
-        "weekly_report_auto",
-        "tuesday_recap",
-        "nfl_finals_watch",
-    ]
-    for name in loop_names:
-        loop = globals().get(name)
-        if loop:
-            try:
-                if not loop.is_running():
-                    loop.start()
-                    print(f"[TASKS] Started loop: {name}")
-                else:
-                    print(f"[TASKS] Loop already running: {name}")
-            except Exception as e:
-                print(f"[TASKS ERROR] {name}: {e}")
-
-    TASKS_STARTED = True
-
 @bot.event
 async def on_ready():
     global announce_channel
     announce_channel = bot.get_channel(ANNOUNCE_CHANNEL_ID)
+    print(f"Logged in as {bot.user} | Announce channel: {announce_channel}")
 
-    print("======== BOT START ========")
-    print(f"Logged in as: {bot.user} (user id: {bot.user.id})")
-    print(f"Application ID: {bot.application_id}")
-    print(f"Announce channel: {announce_channel}")
-    print("Guilds I'm in:")
-    for g in bot.guilds:
-        print(f" - {g.name} ({g.id})")
+    # Register slash commands
+    await tree.sync()
 
-    # Ensure commands are registered (once per guild)
-    await sync_commands_once_per_guild()
-
-    # Start background tasks only once (guards against reconnects)
-    await start_background_tasks_once()
-
-    print("======== READY ==========")
+    # Start background tasks
+    weekly_report_auto.start()
+    tuesday_recap.start()
+    transactions_watch.start()
+    injury_watch.start()
+    nfl_finals_watch.start()
 
 if __name__ == "__main__":
-    _start_keepalive()  # start tiny HTTP server for Render Web Service
-    print("[BOOT] Calling bot.run() ...")
-    try:
-        bot.run(DISCORD_TOKEN)
+    bot.run(DISCORD_TOKEN)
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print("[FATAL]", e)

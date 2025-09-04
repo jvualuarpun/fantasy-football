@@ -26,6 +26,8 @@ from pathlib import Path
 from openai import AsyncOpenAI
 from espn_api.football import League
 import httpx
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # --------------------- Load config ---------------------
 dotenv_file = Path(__file__).with_name('.env')

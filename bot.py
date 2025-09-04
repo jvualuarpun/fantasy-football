@@ -8,6 +8,7 @@ import asyncio
 import datetime as dt
 import logging
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs  # NEW: allow parsing leagueId from a URL
 
 import discord
 from discord import app_commands
@@ -41,8 +42,47 @@ def _getenv_str(name: str) -> Optional[str]:
         return None
     return v
 
-LEAGUE_ID = _getenv_str("LEAGUE_ID")
-YEAR = int(_getenv_str("YEAR") or "2025")
+def _detect_league_id() -> Optional[str]:
+    """Find LEAGUE_ID from multiple env names or parse it from a league URL."""
+    # Common variable names people set
+    for key in ("LEAGUE_ID", "ESPN_LEAGUE_ID", "LEAGUEID"):
+        v = _getenv_str(key)
+        if v and v.isdigit():
+            return v
+    # Try parsing from a full ESPN URL if provided
+    url = _getenv_str("LEAGUE_URL") or _getenv_str("ESPN_LEAGUE_URL")
+    if url:
+        try:
+            q = parse_qs(urlparse(url).query)
+            lid = q.get("leagueId") or q.get("leagueid")
+            if lid:
+                lid_val = str(lid[0]).strip()
+                if lid_val.isdigit():
+                    return lid_val
+        except Exception:
+            pass
+    return None
+
+def _detect_year(default_year: str = "2025") -> int:
+    """Pick YEAR; prefer explicit env, else parse seasonId from URL, else default."""
+    y = _getenv_str("YEAR")
+    if y and y.isdigit():
+        return int(y)
+    url = _getenv_str("LEAGUE_URL") or _getenv_str("ESPN_LEAGUE_URL")
+    if url:
+        try:
+            q = parse_qs(urlparse(url).query)
+            sid = q.get("seasonId") or q.get("season") or []
+            if sid:
+                s = str(sid[0]).strip()
+                if s.isdigit():
+                    return int(s)
+        except Exception:
+            pass
+    return int(default_year)
+
+LEAGUE_ID = _detect_league_id()
+YEAR = _detect_year("2025")
 # Public league mode: cookies not needed
 ESPN_S2 = None
 SWID = None
@@ -83,7 +123,7 @@ def _league_ready() -> Tuple[bool, Optional[str]]:
     if not ESPn_AVAILABLE:
         return False, "Python package 'espn_api' is not installed."
     if not LEAGUE_ID:
-        return False, "Missing LEAGUE_ID env variable."
+        return False, "Missing LEAGUE_ID env variable (set LEAGUE_ID=digits or LEAGUE_URL with leagueId=...)."
     return True, None
 
 def _safe_str(x) -> str:

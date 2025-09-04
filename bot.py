@@ -408,6 +408,39 @@ def err_embed(msg: str) -> discord.Embed:
 def join_lines(lines: List[str]) -> str:
     return "\n".join(lines)
 
+def league_context_for_ai(max_teams: int = 8) -> str:
+    """
+    Small, neutral context for the assistant: lineup rules + a short view of the league.
+    Keeps it generic; no canned answers.
+    """
+    lineup = ", ".join(f"{k}:{v}" for k, v in LEAGUE_SNAPSHOT.get("lineup", {}).items())
+    last = LEAGUE_SNAPSHOT["meta"].get("last_refresh", "never")
+
+    # Build a lightweight top list (if projections exist)
+    totals = []
+    for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
+        total = compute_team_projection(t)
+        totals.append((t.get("name", f"Team {tid}"), float(total)))
+    totals.sort(key=lambda x: x[1], reverse=True)
+
+    top_lines = []
+    if totals and any(v > 0 for _, v in totals):
+        for name, v in totals[:max_teams]:
+            top_lines.append(f"- {name}: {v:.1f}")
+    else:
+        # Still give the assistant a sense of the league membership without numbers
+        for tid, t in list(LEAGUE_SNAPSHOT.get("teams", {}).items())[:max_teams]:
+            top_lines.append(f"- {t.get('name', f'Team {tid}')}")
+
+    context = (
+        "You are a helpful fantasy football assistant inside a Discord server.\n"
+        "You have access to a brief league snapshot to ground your answers.\n\n"
+        f"Lineup rules: {lineup}\n"
+        f"Last refresh: {last}\n"
+        "Teams overview:\n" + "\n".join(top_lines)
+    )
+    return context
+
 def chunk_text(s: str, limit: int = 1900) -> List[str]:
     """Split a long string into Discord-safe chunks."""
     chunks: List[str] = []
@@ -448,80 +481,40 @@ async def sync_cleanup(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(embed=err_embed(f"Sync failed: {e}"), ephemeral=True)
 
-# --- Upgraded /ask ---
-@bot.tree.command(name="ask", description="Ask something (league-aware).")
+@bot.tree.command(name="ask", description="Ask anything — generic assistant reply with light league context.")
 @app_commands.describe(question="Your question")
 async def ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
     await refresh_snapshot()
 
-    # Compute projections league-wide
-    totals = []
-    for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
-        totals.append((t.get("name", f"Team {tid}"), compute_team_projection(t)))
-    totals = [(n, float(v)) for (n, v) in totals]
-    totals.sort(key=lambda x: x[1], reverse=True)
-
-    if not totals:
-        await interaction.followup.send(
-            "I don't have league data yet. Make sure **LEAGUE_ID** (or **LEAGUE_URL**) is set and the league is public."
-        )
-        return
-
-    qlow = question.lower()
-    wants_rankings = any(
-        k in qlow for k in (
-            "who is going to win", "who's going to win", "who will win",
-            "prediction", "predictions", "top 3", "top three",
-            "power rank", "rank the teams"
-        )
-    )
-
-    if wants_rankings:
-        top = totals[:3]
-        if all(v == 0.0 for (_, v) in top):
-            await interaction.followup.send(
-                "Projections for this scoring period aren't available yet from ESPN. Try again later, or use **/roster**."
-            )
-            return
-        lines = [f"**Top {len(top)} by projected starting lineup**"]
-        for i, (name, pts) in enumerate(top, start=1):
-            lines.append(f"{i}. **{name}** — {pts:.1f} projected")
-        lines.append(f"Snapshot: {LEAGUE_SNAPSHOT['meta'].get('last_refresh','never')}")
-        await interaction.followup.send("\n".join(lines))
-        return
-
+    # If an OpenAI Assistant is configured, route the question straight through (no canned logic).
     if bot.assistant.enabled:
-        lineup_info = ", ".join(f"{k}:{v}" for k, v in LEAGUE_SNAPSHOT.get("lineup", {}).items())
-        top_preview = "\n".join(f"- {name}: {pts:.1f}" for name, pts in totals[:8])
-        context = (
-            "League snapshot context:\n"
-            f"Lineup counts → {lineup_info}\n"
-            "Top teams by projected starting lineup:\n"
-            f"{top_preview}\n"
-            "Answer the user's question using this context. If the question asks for predictions, "
-            "reference the projected totals."
-        )
-        await bot.assistant.add_to_thread(context, role="system")
-        await bot.assistant.add_to_thread(question, role="user")
-        reply = await bot.assistant.get_reply()
-        await interaction.followup.send(reply)
-        return
+        try:
+            context = league_context_for_ai(max_teams=8)
+            # Provide minimal grounding to the assistant, then the user’s question.
+            await bot.assistant.add_to_thread(context, role="system")
+            await bot.assistant.add_to_thread(question, role="user")
+            reply = await bot.assistant.get_reply()
+            if not isinstance(reply, str) or not reply.strip():
+                reply = "I couldn’t generate a reply just now."
+            await send_long_followup(interaction, reply.strip())
+            return
+        except Exception as e:
+            logger.exception("Assistant /ask failed: %s", e)
+            await interaction.followup.send("Assistant error. Please try again in a moment.")
+            return
 
-    # Fallback
-    lineup_info = "\n".join(f"{k}: {v}" for k, v in LEAGUE_SNAPSHOT.get("lineup", {}).items())
-    lines = [
-        f"**Q:** {question}",
-        "**Top 5 by projected starting lineup:**",
-        *(f"- {name}: {pts:.1f}" for name, pts in totals[:5]),
-        "",
-        "**Lineup (fixed counts):**",
-        lineup_info,
-        f"Snapshot: {LEAGUE_SNAPSHOT['meta'].get('last_refresh','never')}",
-        "",
-        "_Tip: ask '**who will win**' or '**top 3 predictions**' to get ranked picks._",
-    ]
-    await interaction.followup.send("\n".join(lines))
+    # Fallback if no assistant is configured
+    missing = []
+    if not OPENAI_API_KEY: missing.append("OPENAI_API_KEY")
+    if not OPENAI_ASSISTANT_ID: missing.append("OPENAI_ASSISTANT_ID")
+    if not OPENAI_THREAD_ID: missing.append("OPENAI_THREAD_ID")
+    msg = (
+        "Generic chat is not enabled because the OpenAI Assistant isn’t configured.\n"
+        "Set these env vars and redeploy: " + (", ".join(missing) if missing else "(missing configuration)")
+    )
+    await interaction.followup.send(msg)
+
 
 @bot.tree.command(name="roster", description="Show a team's roster.")
 @app_commands.describe(team="Team name or manager (partial ok)")

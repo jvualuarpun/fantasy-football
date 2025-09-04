@@ -275,13 +275,14 @@ class FantasyBot(commands.Bot):
         self.assistant = DiscordOpenAIInterface()
 
     async def setup_hook(self) -> None:
-        # Global commands only — clear any guild-bound commands by syncing globally
-        try:
-            await self.tree.sync()
-            self.synced = True
-            logger.info("Global application commands synced.")
-        except Exception as e:
-            logger.exception("Failed to sync global commands: %s", e)
+    try:
+        # Force global sync (guild=None ensures it's global only)
+        commands = await self.tree.sync(guild=None)
+        self.synced = True
+        logger.info(f"✅ Global slash commands synced ({len(commands)}): {[c.name for c in commands]}")
+    except Exception as e:
+        logger.exception("❌ Failed to sync global commands: %s", e)
+
 
 bot = FantasyBot()
 
@@ -392,17 +393,54 @@ async def draftboard(interaction: discord.Interaction):
         lines.append(f"{item.get('pick', '?')}. **{item.get('team_name', 'Team')}** → {p['name']}{team_abbrev}")
     await interaction.response.send_message(join_lines(lines))
 
-@bot.tree.command(name="grades", description="Draft/roster grades based on projected starting lineup.")
+def compute_team_breakdown(team: dict) -> Dict[str, float]:
+    """Return projected points by slot (QB, RB, WR, TE, FLEX, K)."""
+    lineup = LEAGUE_SNAPSHOT.get("lineup", {})
+    pid_list = team.get("players", [])
+    pos_map = {"QB": [], "RB": [], "WR": [], "TE": [], "K": []}
+    flex_pool = []
+    for pid in pid_list:
+        p = LEAGUE_SNAPSHOT["players"].get(pid)
+        if not p:
+            continue
+        pos = (p.get("position") or "").upper()
+        proj = float(p.get("projections") or 0.0)
+        if pos in pos_map:
+            pos_map[pos].append(proj)
+        if pos in ("RB", "WR", "TE"):
+            flex_pool.append(proj)
+    breakdown = {}
+    for pos, need in lineup.items():
+        if pos == "FLEX":
+            continue
+        vals = sorted(pos_map.get(pos, []), reverse=True)
+        breakdown[pos] = sum(vals[:int(need or 0)])
+    if lineup.get("FLEX", 0):
+        flex_pool.sort(reverse=True)
+        breakdown["FLEX"] = sum(flex_pool[: int(lineup["FLEX"])])
+    return breakdown
+
+@bot.tree.command(name="grades", description="Roster grades with slot breakdown.")
 async def grades(interaction: discord.Interaction):
     await refresh_snapshot()
-    results = compute_grades()
+    results = []
+    for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
+        breakdown = compute_team_breakdown(t)
+        total = sum(breakdown.values())
+        results.append((t["name"], breakdown, total))
     if not results:
-        await interaction.response.send_message("No league data available to compute grades. Check your ESPN credentials.")
+        await interaction.response.send_message("No league data available.")
         return
-    lines = ["**Roster Strength Grades** (z-score based)"]
-    for name, total, z, letter in results:
-        lines.append(f"- {name}: **{letter}**  (proj: {total:.1f}, z={z:+.2f})")
-    await interaction.response.send_message(join_lines(lines))
+    totals = [r[2] for r in results]
+    mean, sd = sum(totals)/len(totals), (sum((x - (sum(totals)/len(totals)))**2 for x in totals)/max(1,len(totals)-1))**0.5
+    lines = ["**Roster Grades**"]
+    for name, breakdown, total in sorted(results, key=lambda x: x[2], reverse=True):
+        z = (total - mean)/sd if sd else 0
+        grade = grade_from_zscore(z)
+        parts = ", ".join([f"{k}:{v:.1f}" for k,v in breakdown.items()])
+        lines.append(f"- **{name}** → {grade} (proj {total:.1f}, z={z:+.2f}) [{parts}]")
+    await interaction.response.send_message("\n".join(lines))
+
 
 # Alias for /grades
 @app_commands.command(name="draft_grades", description="Alias of /grades.")
@@ -442,7 +480,16 @@ async def weekly_report(interaction: discord.Interaction):
 # -------- Background: live refresh --------
 @tasks.loop(minutes=10)
 async def auto_refresh_snapshot():
+    """Refresh ESPN data every 10m on game days, every 2h otherwise."""
+    dow = dt.datetime.utcnow().weekday()  # Monday=0, Sunday=6
+    # Tue (1), Wed (2), Fri (4), Sat (5) → only refresh every 2 hours
+    if dow in (1, 2, 4, 5):
+        now = dt.datetime.utcnow()
+        # Only refresh at even hours (0:00, 2:00, 4:00, etc.)
+        if now.hour % 2 != 0:
+            return
     await refresh_snapshot()
+
 
 @auto_refresh_snapshot.before_loop
 async def before_auto_refresh():
@@ -461,11 +508,22 @@ async def before_heartbeat():
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
+
     if not heartbeat.is_running():
         heartbeat.start()
     if not auto_refresh_snapshot.is_running():
         auto_refresh_snapshot.start()
+
+    # Refresh ESPN snapshot immediately
     await refresh_snapshot(force=True)
+
+    # Debug: log which commands are registered
+    try:
+        commands = await bot.tree.fetch_commands()
+        logger.info(f"🔎 Slash commands loaded ({len(commands)}): {[c.name for c in commands]}")
+    except Exception as e:
+        logger.exception("❌ Failed to fetch commands: %s", e)
+
 
 if __name__ == "__main__":
     if BOT_TOKEN == "REPLACE_ME":

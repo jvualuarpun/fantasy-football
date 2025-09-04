@@ -33,8 +33,8 @@ BOT_TOKEN = os.getenv("DISCORD_TOKEN", "REPLACE_ME")
 # -------- ESPN config --------
 LEAGUE_ID = os.getenv("LEAGUE_ID")
 YEAR = int(os.getenv("YEAR", "2025"))
-ESPN_S2 = os.getenv("ESPN_S2")
-SWID = os.getenv("SWID")
+ESPN_S2 = None
+SWID = None
 
 ESPn_AVAILABLE = True
 try:
@@ -71,9 +71,10 @@ def format_lineup_counts(snapshot: dict) -> str:
 def _league_ready() -> Tuple[bool, Optional[str]]:
     if not ESPn_AVAILABLE:
         return False, "Python package 'espn_api' is not installed."
-    if not (LEAGUE_ID and ESPN_S2 and SWID):
-        return False, "Missing LEAGUE_ID/ESPN_S2/SWID env variables."
+    if not LEAGUE_ID:
+        return False, "Missing LEAGUE_ID env variable."
     return True, None
+
 
 def _safe_str(x) -> str:
     try:
@@ -89,7 +90,7 @@ async def refresh_snapshot(force: bool = False) -> None:
         return
     now = dt.datetime.utcnow().isoformat()
     try:
-        lg = League(league_id=int(LEAGUE_ID), year=YEAR, espn_s2=ESPN_S2, swid=SWID)
+        lg = League(league_id=int(LEAGUE_ID), year=YEAR)
 
         # Teams / players
         teams_map: Dict[str, dict] = {}

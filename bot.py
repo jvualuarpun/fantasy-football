@@ -7,8 +7,10 @@ import re
 import asyncio
 import datetime as dt
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, parse_qs  # NEW: allow parsing leagueId from a URL
+from urllib.parse import urlparse, parse_qs
 
 import discord
 from discord import app_commands
@@ -31,6 +33,9 @@ else:
 
 BOT_TOKEN = os.getenv("DISCORD_TOKEN", "REPLACE_ME")
 
+# Force per-guild sync (for instant updates) while keeping global-only as source of truth.
+FORCE_GUILD_ID = int(os.getenv("FORCE_GUILD_ID", "0") or 0)
+
 # -------- ESPN config --------
 def _getenv_str(name: str) -> Optional[str]:
     """Normalize env strings: strip whitespace; map '', 'none', 'null' -> None."""
@@ -44,12 +49,10 @@ def _getenv_str(name: str) -> Optional[str]:
 
 def _detect_league_id() -> Optional[str]:
     """Find LEAGUE_ID from multiple env names or parse it from a league URL."""
-    # Common variable names people set
     for key in ("LEAGUE_ID", "ESPN_LEAGUE_ID", "LEAGUEID"):
         v = _getenv_str(key)
         if v and v.isdigit():
             return v
-    # Try parsing from a full ESPN URL if provided
     url = _getenv_str("LEAGUE_URL") or _getenv_str("ESPN_LEAGUE_URL")
     if url:
         try:
@@ -257,8 +260,7 @@ def compute_grades() -> List[Tuple[str, float, float, str]]:
 class DiscordOpenAIInterface:
     """
     Remembers messages by pushing them into an OpenAI Thread and replies when bot is mentioned.
-    Uses an asyncio Queue + Lock to avoid runs being executed against the wrong latest message
-    in high-traffic channels (pattern inspired by the Medium article). :contentReference[oaicite:3]{index=3}
+    Uses an asyncio Queue + Lock to avoid runs being executed against the wrong latest message.
     """
     def __init__(self):
         self.enabled = bool(OpenAI_AVAILABLE and OPENAI_API_KEY and OPENAI_ASSISTANT_ID and OPENAI_THREAD_ID)
@@ -271,7 +273,6 @@ class DiscordOpenAIInterface:
 
     @staticmethod
     def thread_format(message: discord.Message) -> str:
-        # Prefix each message with the author name for multi-user memory (per article). :contentReference[oaicite:4]{index=4}
         return f"{message.author.display_name} said: {message.clean_content}"
 
     async def add_to_thread(self, message_text: str, role: str = "user") -> None:
@@ -297,7 +298,6 @@ class DiscordOpenAIInterface:
                 self.message_queue.task_done()
 
     async def get_reply(self) -> str:
-        """Run the assistant safely while locking queue (prevents race conditions). :contentReference[oaicite:5]{index=5}"""
         if not self.enabled:
             return "Assistant not configured."
         async with self.queue_lock:
@@ -318,6 +318,28 @@ class DiscordOpenAIInterface:
                 logger.exception("OpenAI run failed: %s", e)
                 return "(assistant error)"
 
+# ---------- Tiny HTTP health server (for Render Web Service) ----------
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in ("/", "/health", "/ping"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.end_headers()
+        def log_message(self, fmt, *args):
+            # Silence default HTTP server logging
+            return
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    logger.info("Health server bound to 0.0.0.0:%s", port)
+    return server
+
 # ---------- Bot ----------
 class FantasyBot(commands.Bot):
     def __init__(self):
@@ -327,12 +349,20 @@ class FantasyBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         try:
-            # Force global sync (guild=None ensures it's global only)
-            commands = await self.tree.sync(guild=None)
+            # (Optional) Instant per-guild sync for your server, sourced from the global tree
+            if FORCE_GUILD_ID:
+                guild_obj = discord.Object(id=FORCE_GUILD_ID)
+                # Copy current global command definitions into the guild scope for instant availability
+                self.tree.copy_global_to(guild=guild_obj)
+                gcmds = await self.tree.sync(guild=guild_obj)
+                logger.info("✅ Guild commands synced to %s (%d): %s", FORCE_GUILD_ID, len(gcmds), [c.name for c in gcmds])
+
+            # Always sync globals (authoritative)
+            gc = await self.tree.sync(guild=None)
             self.synced = True
-            logger.info(f"✅ Global slash commands synced ({len(commands)}): {[c.name for c in commands]}")
+            logger.info("✅ Global slash commands synced (%d): %s", len(gc), [c.name for c in gc])
         except Exception as e:
-            logger.exception("❌ Failed to sync global commands: %s", e)
+            logger.exception("❌ Failed to sync application commands: %s", e)
 
 bot = FantasyBot()
 
@@ -341,17 +371,13 @@ bot = FantasyBot()
 async def on_message(message: discord.Message):
     if not ALLOW_MESSAGE_MEMORY:
         return
-    # Ignore bot messages
     if message.author.bot:
         return
-    # Record every message into thread
     if bot.assistant.enabled:
         await bot.assistant.add_to_thread(bot.assistant.thread_format(message), role="user")
-        # If the bot is mentioned directly, ask the assistant to reply
         if (bot.user in message.mentions) and (not message.mention_everyone):
             reply = await bot.assistant.get_reply()
             await message.channel.send(reply)
-    # Allow slash commands to work
     await bot.process_commands(message)
 
 # --------------- Utilities -----------------
@@ -367,7 +393,6 @@ def join_lines(lines: List[str]) -> str:
     return "\n".join(lines)
 
 # ---------- Commands ----------
-
 @bot.tree.command(name="sync_cleanup", description="Clear stale guild commands after switching back to global-only.")
 @app_commands.default_permissions(manage_guild=True)
 async def sync_cleanup(interaction: discord.Interaction):
@@ -379,6 +404,27 @@ async def sync_cleanup(interaction: discord.Interaction):
         )
     except Exception as e:
         await interaction.response.send_message(embed=err_embed(f"Sync failed: {e}"), ephemeral=True)
+
+@bot.tree.command(name="resync", description="Force re-sync commands (Manage Server).")
+@app_commands.default_permissions(manage_guild=True)
+async def resync(interaction: discord.Interaction):
+    try:
+        # Re-sync global
+        gc = await bot.tree.sync(guild=None)
+        msgs = [f"Global synced ({len(gc)})"]
+
+        # Re-sync guild (instant) if enabled
+        if FORCE_GUILD_ID:
+            guild_obj = discord.Object(id=FORCE_GUILD_ID)
+            bot.tree.copy_global_to(guild=guild_obj)
+            gcmds = await bot.tree.sync(guild=guild_obj)
+            msgs.append(f"Guild {FORCE_GUILD_ID} synced ({len(gcmds)})")
+
+        await interaction.response.send_message(" / ".join(msgs), ephemeral=True)
+        logger.info("Manual resync done: %s", " / ".join(msgs))
+    except Exception as e:
+        logger.exception("Manual resync failed: %s", e)
+        await interaction.response.send_message(f"Resync failed: {e}", ephemeral=True)
 
 @bot.tree.command(name="ask", description="Ask something (league-aware).")
 @app_commands.describe(question="Your question")
@@ -570,8 +616,8 @@ async def on_ready():
 
     # Debug: log which commands are registered
     try:
-        commands = await bot.tree.fetch_commands()
-        logger.info(f"🔎 Slash commands loaded ({len(commands)}): {[c.name for c in commands]}")
+        commands_list = await bot.tree.fetch_commands()
+        logger.info(f"🔎 Slash commands loaded ({len(commands_list)}): {[c.name for c in commands_list]}")
     except Exception as e:
         logger.exception("❌ Failed to fetch commands: %s", e)
 
@@ -579,4 +625,6 @@ if __name__ == "__main__":
     if BOT_TOKEN == "REPLACE_ME":
         logger.warning("DISCORD_TOKEN env var not set. Please set it before running.")
     else:
+        # Bind a tiny HTTP server so Render Web Service sees an open port
+        _server = start_health_server()
         bot.run(BOT_TOKEN)

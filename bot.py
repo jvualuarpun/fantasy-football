@@ -26,6 +26,13 @@ load_dotenv()  # read .env for DISCORD_TOKEN, ESPN creds, OpenAI, toggles
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("fantasy-bot")
 
+# --- NEW: make sure logs flush immediately (helps Render show logs in real time)
+for h in logging.getLogger().handlers:
+    try:
+        h.flush = getattr(h.stream, "flush", lambda: None)
+    except Exception:
+        pass
+
 # Quieten noisy httpx request logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -38,6 +45,14 @@ else:
     INTENTS.message_content = False
 
 BOT_TOKEN = os.getenv("DISCORD_TOKEN", "REPLACE_ME")
+
+# --- NEW: boot “safe-mode” toggles & verbose switch
+SKIP_BOOT_SNAPSHOT  = os.getenv("SKIP_BOOT_SNAPSHOT", "false").lower() == "true"
+SKIP_STARTUP_ALERTS = os.getenv("SKIP_STARTUP_ALERTS", "false").lower() == "true"
+PY_LOG_VERBOSE      = os.getenv("PY_LOG_VERBOSE", "false").lower() == "true"
+if PY_LOG_VERBOSE:
+    logger.setLevel(logging.DEBUG)
+    logging.getLogger("discord").setLevel(logging.INFO)
 
 # -------- Alerts config (scores/injuries) --------
 ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0") or 0)
@@ -819,8 +834,9 @@ async def _fetch_text(url: str) -> Optional[str]:
     if not _HTTPX:
         return None
     try:
+        # --- CHANGED: slightly shorter timeout so startup isn’t held forever
         async with _ESPN_SEM:
-            async with httpx.AsyncClient(timeout=20, headers=DEFAULT_HEADERS) as client:
+            async with httpx.AsyncClient(timeout=10, headers=DEFAULT_HEADERS) as client:
                 r = await client.get(url)
                 r.raise_for_status()
                 return r.text
@@ -910,7 +926,7 @@ async def _post_startup_scores(ch: discord.TextChannel):
     if not POST_SCORES or not _HTTPX:
         return
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(SCOREBOARD_URL)
             r.raise_for_status()
             data = r.json()
@@ -1371,7 +1387,10 @@ async def weekly_report(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     await recap.callback(interaction)
 
-@bot.tree.command(name="status", description="Show ESPN connection status & snapshot info.")
+@bot.tree.command(
+    name="status",
+    description="Show ESPN connection status & snapshot info."
+)
 async def status(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
     ready, why = _league_ready()
@@ -1525,26 +1544,50 @@ async def before_heartbeat():
 # --------- Startup ---------
 @bot.event
 async def on_ready():
-    logger.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
+    logger.info("=== on_ready fired: logged in as %s (%s) ===", bot.user, bot.user.id if bot.user else "unknown")
     logger.info("Config check: LEAGUE_ID=%r YEAR=%s ALERT_CHANNEL_ID=%s", LEAGUE_ID, YEAR, ALERT_CHANNEL_ID)
 
     if not heartbeat.is_running():
+        logger.info("Starting heartbeat loop…")
         heartbeat.start()
     if not auto_refresh_snapshot.is_running():
+        logger.info("Starting auto_refresh_snapshot loop…")
         auto_refresh_snapshot.start()
     if not poll_alerts.is_running():
+        logger.info("Starting poll_alerts loop…")
         poll_alerts.start()
 
-    await refresh_snapshot(force=True)
-    await startup_alerts()
+    # --- NEW: guarded boot steps so Render never hangs on slow ESPN/network
+    try:
+        if SKIP_BOOT_SNAPSHOT:
+            logger.warning("SKIP_BOOT_SNAPSHOT=true — skipping refresh_snapshot at boot")
+        else:
+            logger.info("Boot: calling refresh_snapshot(force=True)…")
+            await refresh_snapshot(force=True)
+            logger.info("Boot: refresh_snapshot done.")
+    except Exception as e:
+        logger.exception("Boot: refresh_snapshot errored: %s", e)
+
+    try:
+        if SKIP_STARTUP_ALERTS:
+            logger.warning("SKIP_STARTUP_ALERTS=true — skipping startup_alerts() at boot")
+        else:
+            logger.info("Boot: calling startup_alerts()…")
+            await startup_alerts()
+            logger.info("Boot: startup_alerts done.")
+    except Exception as e:
+        logger.exception("Boot: startup_alerts errored: %s", e)
 
     with contextlib.suppress(Exception):
         commands_list = await bot.tree.fetch_commands()
         logger.info(f"🔎 Slash commands loaded ({len(commands_list)}): {[c.name for c in commands_list]}")
 
+    logger.info("=== Bot ready ===")
+
 if __name__ == "__main__":
     if BOT_TOKEN == "REPLACE_ME":
         logger.warning("DISCORD_TOKEN env var not set. Please set it before running.")
     else:
+        logger.info("Starting health server and Discord client…")
         _server = start_health_server()  # keep Render Web Service alive
         bot.run(BOT_TOKEN)

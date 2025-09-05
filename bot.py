@@ -1404,7 +1404,7 @@ async def status(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="injuries",
-    description="List ESPN team injury updates for a date range (e.g., 'Sep 1-5', 'Sep 3', or '2025-09-01..2025-09-05')."
+    description="Post recent ESPN injury updates to this channel."
 )
 @app_commands.describe(
     date_range="Examples: 'Sep 1-5', 'Sep 3', '2025-09-01..2025-09-05'"

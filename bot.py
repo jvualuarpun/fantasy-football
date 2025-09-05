@@ -42,19 +42,28 @@ POST_SCORES = os.getenv("POST_SCORES", "true").lower() == "true"
 POST_INJURIES = os.getenv("POST_INJURIES", "true").lower() == "true"
 STATE_PATH = os.getenv("STATE_PATH", "state.json")
 
-# Tunables (ENV) for injury posting behavior
-INJURY_POST_LIMIT = int(os.getenv("INJURY_POST_LIMIT", "25"))       # total items to post per cycle
-INJURY_PRIORITY_LIMIT = int(os.getenv("INJURY_PRIORITY_LIMIT", "40"))# max priority items (posted first)
-INJURY_MAX_DAYS = int(os.getenv("INJURY_MAX_DAYS", "5"))            # general injuries recency
-INJURY_MAX_DAYS_Q = int(os.getenv("INJURY_MAX_DAYS_Q", "21"))       # priority designations recency
+# Tunables (ENV)
+INJURY_POST_LIMIT = int(os.getenv("INJURY_POST_LIMIT", "30"))        # total injuries to post per cycle
+INJURY_PRIORITY_LIMIT = int(os.getenv("INJURY_PRIORITY_LIMIT", "60")) # cap of priority-tagged injuries (Q/D/Out/Inactive/Probable)
+INJURY_MAX_DAYS = int(os.getenv("INJURY_MAX_DAYS", "5"))             # recency for general injuries
+INJURY_MAX_DAYS_Q = int(os.getenv("INJURY_MAX_DAYS_Q", "21"))        # recency for key designations
+SCORE_POST_LIMIT = int(os.getenv("SCORE_POST_LIMIT", "12"))          # safety cap
 
-# httpx for ESPN site APIs
+# httpx for ESPN site APIs / pages
 try:
     import httpx
     _HTTPX = True
 except Exception as e:
     _HTTPX = False
     logger.warning("httpx unavailable: %s", e)
+
+# BeautifulSoup for scraping team injuries pages
+try:
+    from bs4 import BeautifulSoup
+    _BS4 = True
+except Exception as e:
+    _BS4 = False
+    logger.warning("beautifulsoup4 unavailable: %s (pip install beautifulsoup4)", e)
 
 # -------- ESPN config --------
 def _getenv_str(name: str) -> Optional[str]:
@@ -391,7 +400,7 @@ STATE = _load_state()
 def _state_has(kind: str, key: str) -> bool:
     return key in STATE.get(kind, [])
 
-def _state_add(kind: str, key: str, cap: int = 200) -> None:
+def _state_add(kind: str, key: str, cap: int = 300) -> None:
     arr = STATE.setdefault(kind, [])
     if key not in arr:
         arr.append(key)
@@ -401,8 +410,46 @@ def _state_add(kind: str, key: str, cap: int = 200) -> None:
 
 # ---------- Alerts fetch + post ----------
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-INJURIES_URL   = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries"
 
+# Map ESPN scoreboard abbreviations -> ESPN URL codes + pretty team names
+TEAM_MAP: Dict[str, Tuple[str, str]] = {
+    "ARI": ("ari", "Arizona Cardinals"),
+    "ATL": ("atl", "Atlanta Falcons"),
+    "BAL": ("bal", "Baltimore Ravens"),
+    "BUF": ("buf", "Buffalo Bills"),
+    "CAR": ("car", "Carolina Panthers"),
+    "CHI": ("chi", "Chicago Bears"),
+    "CIN": ("cin", "Cincinnati Bengals"),
+    "CLE": ("cle", "Cleveland Browns"),
+    "DAL": ("dal", "Dallas Cowboys"),
+    "DEN": ("den", "Denver Broncos"),
+    "DET": ("det", "Detroit Lions"),
+    "GB":  ("gb",  "Green Bay Packers"),
+    "HOU": ("hou", "Houston Texans"),
+    "IND": ("ind", "Indianapolis Colts"),
+    "JAX": ("jax", "Jacksonville Jaguars"),
+    "KC":  ("kc",  "Kansas City Chiefs"),
+    "LAC": ("lac", "Los Angeles Chargers"),
+    "LAR": ("lar", "Los Angeles Rams"),
+    "LV":  ("lv",  "Las Vegas Raiders"),
+    "MIA": ("mia", "Miami Dolphins"),
+    "MIN": ("min", "Minnesota Vikings"),
+    "NE":  ("ne",  "New England Patriots"),
+    "NO":  ("no",  "New Orleans Saints"),
+    "NYG": ("nyg", "New York Giants"),
+    "NYJ": ("nyj", "New York Jets"),
+    "PHI": ("phi", "Philadelphia Eagles"),
+    "PIT": ("pit", "Pittsburgh Steelers"),
+    "SEA": ("sea", "Seattle Seahawks"),
+    "SF":  ("sf",  "San Francisco 49ers"),
+    "TB":  ("tb",  "Tampa Bay Buccaneers"),
+    "TEN": ("ten", "Tennessee Titans"),
+    "WAS": ("wsh", "Washington Commanders"),  # ESPN uses "wsh"
+}
+
+ALLOWED_POS = {"QB", "RB", "WR", "TE", "K"}
+
+# --------------- HTTP helpers ---------------
 async def _fetch_json(url: str) -> Optional[dict]:
     if not _HTTPX:
         return None
@@ -415,69 +462,21 @@ async def _fetch_json(url: str) -> Optional[dict]:
         logger.info("Fetch failed %s: %s", url, e)
         return None
 
-async def _get_alert_channel() -> Optional[discord.TextChannel]:
-    if not ALERT_CHANNEL_ID:
+async def _fetch_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
+    try:
+        r = await client.get(url, timeout=15)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        logger.info("Fetch text failed %s: %s", url, e)
         return None
-    ch = bot.get_channel(ALERT_CHANNEL_ID)
-    if ch is None:
-        with contextlib.suppress(Exception):
-            ch = await bot.fetch_channel(ALERT_CHANNEL_ID)
-    if isinstance(ch, discord.TextChannel):
-        return ch
-    return None
 
+# --------------- Score helpers ---------------
 def _score_key(event: dict) -> Optional[str]:
-    # Unique key per game by ESPN event id
     eid = event.get("id")
     if eid:
         return f"score:{eid}"
     return None
-
-def _injury_key(team: dict, item: dict) -> Optional[str]:
-    # Unique-ish key combining athlete id + date + status/type
-    ath = (item.get("athlete") or {})
-    aid = str(ath.get("id") or "")
-    date = (item.get("date") or "")[:19]
-    status_text = (item.get("status") or "").strip()
-    typ = (item.get("type") or {})
-    type_text = (typ.get("text") or typ.get("name") or "").strip()
-    tag = status_text or type_text
-    if aid:
-        return f"inj:{aid}:{date}:{tag}"
-    return None
-
-# ---- helpers for better designation detection ----
-def _extract_designation_parts(item: dict) -> Tuple[str, str, str, bool]:
-    """
-    Returns (designation, type_text, status_text, is_qd) where:
-      - designation is the best human label to show (Questionable/Doubtful/Out/Probable/Inactive/... or fallback)
-      - type_text is e.g. 'Calf'
-      - status_text is raw status if present
-      - is_qd is True if designation is one of the key tags (questionable/doubtful/out/probable/inactive)
-    """
-    typ = (item.get("type") or {})
-    type_text = (typ.get("text") or typ.get("name") or typ.get("shortName") or "").strip()
-    status_text = (item.get("status") or item.get("designation") or "").strip()
-    name_text = (item.get("name") or item.get("shortName") or "").strip()
-    detail = (item.get("detail") or "").strip()
-
-    blob = " ".join([status_text, type_text, name_text, detail]).lower()
-    status_map = {
-        "questionable": "Questionable",
-        "doubtful": "Doubtful",
-        "out": "Out",
-        "probable": "Probable",
-        "inactive": "Inactive",
-    }
-    chosen = None
-    for k, pretty in status_map.items():
-        if k in blob:
-            chosen = pretty
-            break
-
-    designation = chosen or status_text or type_text or "Injury"
-    is_qd = (designation.lower() in status_map)
-    return designation, type_text, status_text, is_qd
 
 def _format_score_line(event: dict) -> Optional[str]:
     try:
@@ -506,26 +505,187 @@ def _format_score_line(event: dict) -> Optional[str]:
     except Exception:
         return None
 
-def _format_injury_line(team: dict, item: dict) -> Optional[str]:
-    try:
-        tname = (team.get("team") or {}).get("displayName") or (team.get("team") or {}).get("shortDisplayName") or "Team"
-        ath = (item.get("athlete") or {})
-        aname = ath.get("displayName") or ath.get("shortName") or "Player"
-        pos = (ath.get("position") or {}).get("abbreviation") or ""
-
-        designation, type_text, _status_text, _is_qd = _extract_designation_parts(item)
-        extra = f" ({type_text})" if type_text and (designation.lower() not in type_text.lower()) else ""
-        detail = (item.get("detail") or "").strip()
-        detail_part = f" {detail}" if detail else ""
-
-        # Hidden marker for dedupe (injuries only)
-        aid = ath.get("id") or "0"
-        when = (item.get("date") or "")[:19]
-
-        return f"🩺 {tname}: {aname} ({pos}) — {designation}{extra}.{detail_part} [#inj {aid}:{when}]"
-    except Exception:
+# --------------- Injury scraping ---------------
+def _parse_date_guess(s: str) -> Optional[dt.datetime]:
+    s = (s or "").strip()
+    if not s:
         return None
+    # Try a few ESPN-like patterns
+    fmts = [
+        "%a, %b %d, %Y", "%b %d, %Y", "%a %b %d, %Y",
+        "%a, %b %d", "%b %d"  # no year
+    ]
+    for f in fmts:
+        with contextlib.suppress(Exception):
+            d = dt.datetime.strptime(s, f)
+            if d.year == 1900:  # no year in string
+                d = d.replace(year=dt.datetime.now(dt.timezone.utc).year)
+            return d.replace(tzinfo=dt.timezone.utc)
+    return None
 
+def _extract_designation_from_text(*parts: str) -> Optional[str]:
+    blob = " ".join([p or "" for p in parts]).lower()
+    for k in ("questionable", "doubtful", "out", "inactive", "probable"):
+        if k in blob:
+            return k.capitalize()
+    return None
+
+def _injury_key(team_abbrev: str, aid: str, when: Optional[dt.datetime], designation: str) -> str:
+    ts = (when.isoformat() if when else "na")
+    return f"inj:{team_abbrev}:{aid}:{ts}:{designation}"
+
+def _sanitize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _extract_player_id_from_href(href: str) -> Optional[str]:
+    # typical: /nfl/player/_/id/1877225/christian-mccaffrey
+    m = re.search(r"/id/(\d+)", href or "")
+    return m.group(1) if m else None
+
+def _pos_clean(s: str) -> str:
+    return (s or "").strip().upper()
+
+def _allowed_pos(s: str) -> bool:
+    return _pos_clean(s) in ALLOWED_POS
+
+async def _scrape_team_injuries(client: httpx.AsyncClient, code: str, pretty_name: str, abbrev: str) -> List[dict]:
+    """
+    Returns list of dicts:
+      { 'team': pretty_name, 'abbrev': abbrev, 'name': str, 'pos': str,
+        'designation': str, 'type': str, 'detail': str, 'when': datetime|None,
+        'athlete_id': str|None }
+    """
+    if not _BS4:
+        return []
+    url = f"https://www.espn.com/nfl/team/injuries/_/name/{code}"
+    html = await _fetch_text(client, url)
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.select("table.Table")
+    out: List[dict] = []
+
+    for table in tables:
+        # Header
+        thead = table.find("thead")
+        if not thead:
+            continue
+        headers = [th.get_text(strip=True).lower() for th in thead.find_all("th")]
+        # Try to map common columns
+        def idx(name_opts: List[str]) -> Optional[int]:
+            for i, h in enumerate(headers):
+                for n in name_opts:
+                    if n in h:
+                        return i
+            return None
+
+        idx_player = idx(["player"])
+        idx_pos = idx(["pos"])
+        idx_injury = idx(["injury"])
+        idx_status = idx(["status", "game status"])
+        idx_desc = idx(["description", "notes"])
+        idx_date = idx(["date", "updated"])
+
+        tbody = table.find("tbody")
+        if not tbody:
+            continue
+
+        for tr in tbody.find_all("tr"):
+            tds = tr.find_all(["td"])
+            if not tds or (idx_player is None or idx_pos is None):
+                continue
+
+            # Player + id
+            player_td = tds[idx_player] if idx_player < len(tds) else None
+            if not player_td:
+                continue
+            a = player_td.find("a")
+            name = _sanitize_space(a.get_text()) if a else _sanitize_space(player_td.get_text())
+            href = a.get("href") if a else ""
+            aid = _extract_player_id_from_href(href) or name.lower().replace(" ", "-")  # fallback
+
+            pos = _pos_clean(tds[idx_pos].get_text() if idx_pos < len(tds) else "")
+            if not _allowed_pos(pos):
+                continue  # skip defense/OL etc.
+
+            injury_type = _sanitize_space(tds[idx_injury].get_text()) if (idx_injury is not None and idx_injury < len(tds)) else ""
+            status_text = _sanitize_space(tds[idx_status].get_text()) if (idx_status is not None and idx_status < len(tds)) else ""
+            desc = _sanitize_space(tds[idx_desc].get_text()) if (idx_desc is not None and idx_desc < len(tds)) else ""
+            date_text = _sanitize_space(tds[idx_date].get_text()) if (idx_date is not None and idx_date < len(tds)) else ""
+            when = _parse_date_guess(date_text)
+
+            designation = _extract_designation_from_text(status_text, injury_type, desc) or (status_text or "Injury")
+            # Keep type separate so we can format "Questionable (Calf)"
+            out.append({
+                "team": pretty_name,
+                "abbrev": abbrev,
+                "name": name,
+                "pos": pos,
+                "designation": designation,
+                "type": injury_type,
+                "detail": desc,
+                "when": when,
+                "athlete_id": aid,
+            })
+    return out
+
+async def _scrape_all_injuries() -> List[dict]:
+    if not _HTTPX or not _BS4:
+        return []
+    async with httpx.AsyncClient(timeout=15) as client:
+        tasks = []
+        for abbr, (code, pretty) in TEAM_MAP.items():
+            tasks.append(_scrape_team_injuries(client, code, pretty, abbr))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    all_items: List[dict] = []
+    for r in results:
+        if isinstance(r, list):
+            all_items.extend(r)
+    return all_items
+
+# --------------- Formatting / posting helpers ---------------
+def _format_injury_line(item: dict) -> str:
+    tname = item.get("team") or item.get("abbrev") or "Team"
+    aname = item.get("name") or "Player"
+    pos = item.get("pos") or ""
+    designation = item.get("designation") or "Injury"
+    type_text = item.get("type") or ""
+    detail = item.get("detail") or ""
+    extra = f" ({type_text})" if type_text and designation.lower() not in type_text.lower() else ""
+    detail_part = f" {detail}" if detail else ""
+    aid = item.get("athlete_id") or "0"
+    when = item.get("when")
+    when_str = (when.isoformat()[:19] if isinstance(when, dt.datetime) else "na")
+    return f"🩺 {tname}: {aname} ({pos}) — {designation}{extra}.{detail_part} [#inj {aid}:{when_str}]"
+
+def _is_priority_designation(designation: str) -> bool:
+    return (designation or "").lower() in {"questionable", "doubtful", "out", "inactive", "probable"}
+
+async def _already_sent(ch: discord.TextChannel, content: str) -> bool:
+    if not ALLOW_MESSAGE_MEMORY:
+        return False
+    try:
+        async for m in ch.history(limit=200):
+            if m.author.id == (bot.user.id if bot.user else 0):
+                if (m.content or "").strip() == content.strip():
+                    return True
+    except Exception:
+        pass
+    return False
+
+async def _get_alert_channel() -> Optional[discord.TextChannel]:
+    if not ALERT_CHANNEL_ID:
+        return None
+    ch = bot.get_channel(ALERT_CHANNEL_ID)
+    if ch is None:
+        with contextlib.suppress(Exception):
+            ch = await bot.fetch_channel(ALERT_CHANNEL_ID)
+    if isinstance(ch, discord.TextChannel):
+        return ch
+    return None
+
+# --------------- Posting logic ---------------
 async def _post_startup_scores(ch: discord.TextChannel):
     if not POST_SCORES:
         return
@@ -536,80 +696,90 @@ async def _post_startup_scores(ch: discord.TextChannel):
     lines: List[Tuple[str, str]] = []
     for ev in events:
         key = _score_key(ev)
-        if not key or _state_has("scores", key):
+        if not key:
             continue
         line = _format_score_line(ev)
         if not line:
             continue
         lines.append((key, line))
 
-    for key, line in lines[:12]:
+    # Post (dedupe by key, plus "already sent" safety)
+    posted = 0
+    for key, line in lines[:SCORE_POST_LIMIT]:
+        if _state_has("scores", key):
+            continue
+        if await _already_sent(ch, line):
+            _state_add("scores", key)  # sync state with recent chat
+            continue
         await ch.send(line)
         _state_add("scores", key)
+        posted += 1
+    if posted:
+        logger.info("Posted %s score lines", posted)
 
-async def _post_startup_injuries(ch: discord.TextChannel):
+async def _post_injuries(ch: discord.TextChannel):
     if not POST_INJURIES:
         return
-    data = await _fetch_json(INJURIES_URL)
-    if not data:
+    items = await _scrape_all_injuries()
+    if not items:
+        logger.info("No injuries scraped (check bs4/httpx availability or ESPN page layout).")
         return
-    teams = data.get("teams") or []
+
     now_utc = dt.datetime.now(dt.timezone.utc)
 
+    # Build buckets with recency gates
     priority: List[Tuple[str, str, dt.datetime]] = []
     regular: List[Tuple[str, str, dt.datetime]] = []
 
-    for team in teams:
-        for it in team.get("injuries", []) or []:
-            key = _injury_key(team, it)
-            if not key or _state_has("injuries", key):
+    for it in items:
+        designation = it.get("designation") or ""
+        when = it.get("when")
+        aid = it.get("athlete_id") or it.get("name") or "na"
+        team_abbr = it.get("abbrev") or "NA"
+
+        days_limit = INJURY_MAX_DAYS_Q if _is_priority_designation(designation) else INJURY_MAX_DAYS
+        if when:
+            if (now_utc - when).days > days_limit:
                 continue
 
-            # Parse date
-            when_raw = it.get("date")
-            dt_when = None
-            with contextlib.suppress(Exception):
-                if when_raw:
-                    dt_when = dt.datetime.fromisoformat(when_raw.replace("Z", "+00:00"))
+        key = _injury_key(team_abbr, str(aid), when, designation)
+        line = _format_injury_line(it)
 
-            designation, _type_text, _status_text, is_qd = _extract_designation_parts(it)
-            days_limit = INJURY_MAX_DAYS_Q if is_qd else INJURY_MAX_DAYS
+        bucket = priority if _is_priority_designation(designation) else regular
+        bucket.append((key, line, when or dt.datetime.min.replace(tzinfo=dt.timezone.utc)))
 
-            # Recency check
-            recent_ok = True
-            if dt_when:
-                if (now_utc - dt_when).days > days_limit:
-                    recent_ok = False
-            if not recent_ok:
-                continue
-
-            line = _format_injury_line(team, it)
-            if not line:
-                continue
-
-            bucket = priority if is_qd else regular
-            bucket.append((key, line, dt_when or dt.datetime.min.replace(tzinfo=dt.timezone.utc)))
-
-    # Sort by newest first
+    # Newest first
     priority.sort(key=lambda x: x[2], reverse=True)
     regular.sort(key=lambda x: x[2], reverse=True)
 
     posted = 0
-    # Post priority items first
     for key, line, _ in priority[:INJURY_PRIORITY_LIMIT]:
         if posted >= INJURY_POST_LIMIT:
             break
+        if _state_has("injuries", key):
+            continue
+        if await _already_sent(ch, line):
+            _state_add("injuries", key)
+            continue
         await ch.send(line)
         _state_add("injuries", key)
         posted += 1
 
-    # Then post regular items up to remaining budget
     remaining = max(0, INJURY_POST_LIMIT - posted)
     for key, line, _ in regular[:remaining]:
+        if _state_has("injuries", key):
+            continue
+        if await _already_sent(ch, line):
+            _state_add("injuries", key)
+            continue
         await ch.send(line)
         _state_add("injuries", key)
         posted += 1
 
+    if posted:
+        logger.info("Posted %s injury lines", posted)
+
+# --------------- Startup orchestration ---------------
 async def startup_alerts():
     ch = await _get_alert_channel()
     if not ch:
@@ -618,23 +788,23 @@ async def startup_alerts():
         else:
             logger.info("ALERT_CHANNEL_ID not set; skipping startup alerts.")
         return
-    # Rehydrate dedupe from last 300 messages if we can read message content
+
+    # Rehydrate dedupe from recent history for injuries only
     if ALLOW_MESSAGE_MEMORY:
         with contextlib.suppress(Exception):
-            async for m in ch.history(limit=300):
+            async for m in ch.history(limit=400):
                 if m.author.id != (bot.user.id if bot.user else 0):
                     continue
-                if m.content:
-                    # score rehydrate disabled (no #score tag anymore)
-                    if "#inj " in m.content:
-                        idx = m.content.find("#inj ")
-                        if idx != -1:
-                            tail = m.content[idx + 5:].split("]")[0].strip()
-                            if tail:
-                                _state_add("injuries", f"inj:{tail}")
-    # Now post new ones
+                if m.content and "#inj " in m.content:
+                    idx = m.content.find("#inj ")
+                    if idx != -1:
+                        tail = m.content[idx + 5:].split("]")[0].strip()
+                        if tail:
+                            _state_add("injuries", f"inj:{tail}")
+
+    # One-time startup posts
     await _post_startup_scores(ch)
-    await _post_startup_injuries(ch)
+    await _post_injuries(ch)
 
 @tasks.loop(minutes=15)
 async def poll_alerts():
@@ -643,7 +813,7 @@ async def poll_alerts():
         if not ch:
             return
         await _post_startup_scores(ch)
-        await _post_startup_injuries(ch)
+        await _post_injuries(ch)
     except Exception as e:
         logger.info("poll_alerts error: %s", e)
 
@@ -912,28 +1082,6 @@ async def projections(interaction: discord.Interaction):
     lines.append(f"\nSnapshot: {LEAGUE_SNAPSHOT['meta'].get('last_refresh','never')}")
     await send_long_followup(interaction, "\n".join(lines))
 
-@bot.tree.command(name="recap", description="Alias of /weekly_report.")
-async def recap(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    await interaction.followup.send("Weekly recap will be implemented with box score parsing.")
-
-@bot.tree.command(name="weekly_report", description="Weekly report.")
-async def weekly_report(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    await recap.callback(interaction)
-
-@bot.tree.command(name="status", description="Show ESPN connection status & snapshot info.")
-async def status(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    ready, why = _league_ready()
-    lines = [
-        f"League ID: {LEAGUE_ID or 'missing'} | Year: {YEAR}",
-        f"Snapshot last refresh: {LEAGUE_SNAPSHOT['meta'].get('last_refresh', 'never')}",
-        f"Ready: {'yes' if ready else 'no'}{f' — {why}' if not ready else ''}",
-        f"Alerts: channel={'set' if ALERT_CHANNEL_ID else 'unset'} scores={'on' if POST_SCORES else 'off'} injuries={'on' if POST_INJURIES else 'off'}",
-    ]
-    await interaction.followup.send("\n".join(lines))
-
 # -------- Background: live refresh --------
 @tasks.loop(minutes=10)
 async def auto_refresh_snapshot():
@@ -966,11 +1114,14 @@ async def on_ready():
         heartbeat.start()
     if not auto_refresh_snapshot.is_running():
         auto_refresh_snapshot.start()
-    if not poll_alerts.is_running():
-        poll_alerts.start()
 
+    # Refresh, then do one-time startup posts
     await refresh_snapshot(force=True)
     await startup_alerts()
+
+    # Start polling AFTER startup posts to avoid duplicate burst
+    if not poll_alerts.is_running():
+        poll_alerts.start()
 
     with contextlib.suppress(Exception):
         commands_list = await bot.tree.fetch_commands()

@@ -44,6 +44,34 @@ ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0") or 0)
 POST_SCORES = os.getenv("POST_SCORES", "true").lower() == "true"
 POST_INJURIES = os.getenv("POST_INJURIES", "true").lower() == "true"
 STATE_PATH = os.getenv("STATE_PATH", "state.json")
+# Injury recency + volume caps
+SCORE_POST_LIMIT       = int(os.getenv("SCORE_POST_LIMIT", "12"))
+INJURY_POST_LIMIT      = int(os.getenv("INJURY_POST_LIMIT", "24"))
+INJURY_PRIORITY_LIMIT  = int(os.getenv("INJURY_PRIORITY_LIMIT", "16"))
+INJURY_MAX_DAYS        = int(os.getenv("INJURY_MAX_DAYS", "3"))
+INJURY_MAX_DAYS_Q      = int(os.getenv("INJURY_MAX_DAYS_Q", "7"))
+
+# NEW: Top-N injury limiter
+INJURY_LIMIT_TO_TOP_N = os.getenv("INJURY_LIMIT_TO_TOP_N", "true").lower() == "true"
+INJURY_TOP_N = int(os.getenv("INJURY_TOP_N", "200"))
+
+TOP_PLAYER_NAMES: set[str] = set()
+
+def refresh_top_players() -> None:
+    """Build Top-N players by projection from LEAGUE_SNAPSHOT."""
+    try:
+        players = list(LEAGUE_SNAPSHOT.get("players", {}).values())
+        ranked = sorted(players, key=lambda p: float(p.get("projections") or 0.0), reverse=True)
+        topn = ranked[:INJURY_TOP_N]
+        TOP_PLAYER_NAMES.clear()
+        for p in topn:
+            nm = (p.get("name") or "").lower().strip()
+            if nm:
+                TOP_PLAYER_NAMES.add(nm)
+        logger.info("Top players list rebuilt (%s names)", len(TOP_PLAYER_NAMES))
+    except Exception as e:
+        logger.warning("Failed to refresh top players: %s", e)
+
 
 # httpx for ESPN site requests
 try:
@@ -199,6 +227,10 @@ async def refresh_snapshot(force: bool = False) -> None:
         LEAGUE_SNAPSHOT["draft"] = draft_list
         LEAGUE_SNAPSHOT["meta"]["last_refresh"] = now
         logger.info("League snapshot refreshed at %s", now)
+        if INJURY_LIMIT_TO_TOP_N:
+            refresh_top_players()
+
+        
     except Exception as e:
         logger.exception("Failed to refresh league snapshot: %s", e)
 
@@ -844,6 +876,13 @@ async def _post_injuries(ch: discord.TextChannel):
 
         if not include:
             continue
+
+        # --- Top-N limiter by player projections (from LEAGUE_SNAPSHOT) ---
+        # Only allow injuries for players in the top-N list (case-insensitive name match)
+        if INJURY_LIMIT_TO_TOP_N:
+            nm = (it.get("name") or "").lower().strip()
+            if nm not in TOP_PLAYER_NAMES:
+                continue
 
         key = _inj_key(it["abbrev"], it["athlete_id"], it["designation"], d_iso)
         line = _fmt_injury_line(it["team"], it["name"], it["pos"], it["designation"], it["type"], it["detail"], d_iso)

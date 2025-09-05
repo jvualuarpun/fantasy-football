@@ -10,7 +10,7 @@ import datetime as dt
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse, parse_qs
 
 import discord
@@ -25,18 +25,32 @@ logger = logging.getLogger("fantasy-bot")
 
 # -------- Discord / Bot config --------
 INTENTS = discord.Intents.default()
-# Slash commands still work either way; message memory (on_message) needs Message Content intent:
 ALLOW_MESSAGE_MEMORY = os.getenv("ALLOW_MESSAGE_MEMORY", "false").lower() == "true"
-if ALLOW_MESSAGE_MEMORY:
-    INTENTS.message_content = True
-else:
-    INTENTS.message_content = False
-
+INTENTS.message_content = True if ALLOW_MESSAGE_MEMORY else False
 BOT_TOKEN = os.getenv("DISCORD_TOKEN", "REPLACE_ME")
+
+# Where to post injuries/scores on startup
+def _parse_int(s: Optional[str]) -> Optional[int]:
+    try:
+        return int(str(s).strip())
+    except Exception:
+        return None
+
+UPDATES_CHANNEL_ID = _parse_int(os.getenv("UPDATES_CHANNEL_ID"))
+POST_UPDATES_ON_START = os.getenv("POST_UPDATES_ON_START", "true").lower() != "false"
+
+# -------- Optional HTTP client for scoreboard --------
+HTTPX_AVAILABLE = True
+try:
+    import httpx  # pip install httpx
+except Exception as e:
+    HTTPX_AVAILABLE = False
+    logger.warning("httpx not available, scoreboard updates disabled: %s", e)
+
+SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 
 # -------- ESPN config --------
 def _getenv_str(name: str) -> Optional[str]:
-    """Normalize env strings: strip whitespace; map '', 'none', 'null' -> None."""
     v = os.getenv(name)
     if v is None:
         return None
@@ -46,7 +60,6 @@ def _getenv_str(name: str) -> Optional[str]:
     return v
 
 def _detect_league_id() -> Optional[str]:
-    """Find LEAGUE_ID from multiple env names or parse it from a league URL."""
     for key in ("LEAGUE_ID", "ESPN_LEAGUE_ID", "LEAGUEID"):
         v = _getenv_str(key)
         if v and v.isdigit():
@@ -65,7 +78,6 @@ def _detect_league_id() -> Optional[str]:
     return None
 
 def _detect_year(default_year: str = "2025") -> int:
-    """Pick YEAR; prefer explicit env, else parse seasonId from URL, else default."""
     y = _getenv_str("YEAR")
     if y and y.isdigit():
         return int(y)
@@ -84,7 +96,6 @@ def _detect_year(default_year: str = "2025") -> int:
 
 LEAGUE_ID = _detect_league_id()
 YEAR = _detect_year("2025")
-# Public league mode: cookies not needed
 ESPN_S2 = None
 SWID = None
 
@@ -107,12 +118,12 @@ except Exception as e:
     OpenAI_AVAILABLE = False
     logger.warning("openai client unavailable: %s", e)
 
-# ---------- League Snapshot (fixed lineup counts) ----------
+# ---------- League Snapshot ----------
 LEAGUE_SNAPSHOT: Dict[str, dict] = {
     "lineup": {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "K": 1, "FLEX": 1},
     "meta": {"last_refresh": None, "league_id": LEAGUE_ID, "year": YEAR},
     "teams": {},    # team_id -> {"name": str, "manager": str, "players": [player_ids...]}
-    "players": {},  # player_id -> {"name": str, "team": "KC", "position": "RB", "projections": float}
+    "players": {},  # player_id -> {"name": str, "team": "KC", "position": "RB", "projections": float, "injury": {...}}
     "draft": [],    # {"pick": int, "team_name": str, "player_id": str}
 }
 
@@ -133,8 +144,20 @@ def _safe_str(x) -> str:
     except Exception:
         return "?"
 
+def _best_float(*vals) -> float:
+    for v in vals:
+        try:
+            if v is None:
+                continue
+            f = float(v)
+            if f > 0:
+                return f
+        except Exception:
+            continue
+    return 0.0
+
+# ---- Refresh league snapshot (robust projections + injury fields) ----
 async def refresh_snapshot(force: bool = False) -> None:
-    """Populate LEAGUE_SNAPSHOT from ESPN API."""
     ok, why = _league_ready()
     if not ok:
         logger.warning("League not ready: %s", why)
@@ -143,7 +166,6 @@ async def refresh_snapshot(force: bool = False) -> None:
     try:
         lg = League(league_id=int(LEAGUE_ID), year=YEAR)
 
-        # Teams / players
         teams_map: Dict[str, dict] = {}
         players_map: Dict[str, dict] = {}
         for t in lg.teams:
@@ -155,19 +177,45 @@ async def refresh_snapshot(force: bool = False) -> None:
                 pid = _safe_str(getattr(p, "playerId", None) or getattr(p, "id", None) or getattr(p, "name", ""))
                 team_abbrev = getattr(p, "proTeam", "") or getattr(p, "proTeamAbbreviation", "") or ""
                 pos = getattr(p, "position", "") or (getattr(p, "eligibleSlots", [""])[0] if getattr(p, "eligibleSlots", None) else "")
+
+                # projections
                 proj = 0.0
                 try:
                     stats = getattr(p, "stats", []) or []
+                    best = 0.0
                     for s in stats:
-                        if getattr(s, "projected_points", None) is not None:
-                            proj = float(s.projected_points)
-                            break
+                        cand = _best_float(
+                            getattr(s, "projected_points", None),
+                            getattr(s, "projected_total", None),
+                            getattr(s, "projectedTotal", None),
+                            getattr(s, "applied_total", None),
+                            getattr(s, "appliedTotal", None),
+                            getattr(s, "points", None),
+                        )
+                        if cand > best:
+                            best = cand
+                    proj = best if best > 0 else _best_float(
+                        getattr(p, "projected_total_points", None),
+                        getattr(p, "total_points", None),
+                        getattr(p, "avg_points", None),
+                    )
                 except Exception:
                     pass
-                players_map[pid] = {"name": getattr(p, "name", f"Player {pid}"),
-                                    "team": team_abbrev,
-                                    "position": pos,
-                                    "projections": proj}
+
+                # injuries (common espn_api attrs)
+                inj_status = getattr(p, "injuryStatus", None) or getattr(p, "injuryStatusMessage", None) or getattr(p, "injuryStatusMessageShort", None)
+                inj_detail = getattr(p, "injuryStatusMessage", None) or getattr(p, "injuryStatusDetail", None)
+                injury = None
+                if inj_status:
+                    injury = {"status": _safe_str(inj_status), "detail": _safe_str(inj_detail or "")}
+
+                players_map[pid] = {
+                    "name": getattr(p, "name", f"Player {pid}"),
+                    "team": team_abbrev,
+                    "position": (pos or "").upper(),
+                    "projections": float(proj or 0.0),
+                    "injury": injury,
+                }
                 roster_ids.append(pid)
             teams_map[str(team_id)] = {"name": team_name, "manager": _safe_str(manager), "players": roster_ids}
 
@@ -191,7 +239,11 @@ async def refresh_snapshot(force: bool = False) -> None:
         LEAGUE_SNAPSHOT["players"] = players_map
         LEAGUE_SNAPSHOT["draft"] = draft_list
         LEAGUE_SNAPSHOT["meta"]["last_refresh"] = now
-        logger.info("League snapshot refreshed at %s", now)
+
+        nonzero = sum(1 for _pid, pdata in players_map.items() if (pdata.get("projections") or 0) > 0)
+        inj_count = sum(1 for _pid, pdata in players_map.items() if pdata.get("injury"))
+        logger.info("League snapshot refreshed | teams=%d players=%d nonzero_proj=%d injuries=%d",
+                    len(teams_map), len(players_map), nonzero, inj_count)
     except Exception as e:
         logger.exception("Failed to refresh league snapshot: %s", e)
 
@@ -211,15 +263,13 @@ def grade_from_zscore(z: float) -> str:
     return "F"
 
 def compute_team_projection(team: dict) -> float:
-    """Sum projections for best starting lineup (based on fixed counts + FLEX from RB/WR/TE)."""
     lineup = LEAGUE_SNAPSHOT.get("lineup", {})
     pid_list = team.get("players", [])
     buckets = {"QB": [], "RB": [], "WR": [], "TE": [], "K": []}
     flex_pool = []
     for pid in pid_list:
         p = LEAGUE_SNAPSHOT["players"].get(pid)
-        if not p:
-            continue
+        if not p: continue
         pos = (p.get("position") or "").upper()
         proj = float(p.get("projections") or 0.0)
         if pos in buckets:
@@ -228,8 +278,7 @@ def compute_team_projection(team: dict) -> float:
             flex_pool.append(proj)
     total = 0.0
     for pos, need in lineup.items():
-        if pos == "FLEX":
-            continue
+        if pos == "FLEX": continue
         arr = sorted(buckets.get(pos, []), reverse=True)
         total += sum(arr[: int(need or 0)])
     flex_need = int(lineup.get("FLEX", 0) or 0)
@@ -239,15 +288,13 @@ def compute_team_projection(team: dict) -> float:
     return total
 
 def compute_team_breakdown(team: dict) -> Dict[str, float]:
-    """Return projected points by slot (QB, RB, WR, TE, FLEX, K)."""
     lineup = LEAGUE_SNAPSHOT.get("lineup", {})
     pid_list = team.get("players", [])
     pos_map = {"QB": [], "RB": [], "WR": [], "TE": [], "K": []}
     flex_pool = []
     for pid in pid_list:
         p = LEAGUE_SNAPSHOT["players"].get(pid)
-        if not p:
-            continue
+        if not p: continue
         pos = (p.get("position") or "").upper()
         proj = float(p.get("projections") or 0.0)
         if pos in pos_map:
@@ -256,8 +303,7 @@ def compute_team_breakdown(team: dict) -> Dict[str, float]:
             flex_pool.append(proj)
     breakdown = {}
     for pos, need in LEAGUE_SNAPSHOT.get("lineup", {}).items():
-        if pos == "FLEX":
-            continue
+        if pos == "FLEX": continue
         vals = sorted(pos_map.get(pos, []), reverse=True)
         breakdown[pos] = sum(vals[:int(need or 0)])
     if LEAGUE_SNAPSHOT.get("lineup", {}).get("FLEX", 0):
@@ -283,10 +329,6 @@ def compute_grades() -> List[Tuple[str, float, float, str]]:
 
 # ---------- OpenAI Assistant Memory ----------
 class DiscordOpenAIInterface:
-    """
-    Remembers messages by pushing them into an OpenAI Thread and replies when bot is mentioned.
-    Uses an asyncio Queue + Lock to avoid runs being executed against the wrong latest message.
-    """
     def __init__(self):
         self.enabled = bool(OpenAI_AVAILABLE and OPENAI_API_KEY and OPENAI_ASSISTANT_ID and OPENAI_THREAD_ID)
         self.client = AsyncOpenAI(api_key=OPENAI_API_KEY) if self.enabled else None
@@ -314,9 +356,8 @@ class DiscordOpenAIInterface:
         while not self.message_queue.empty():
             message_text, role = await self.message_queue.get()
             try:
-                # Threads API expects roles 'user' or 'assistant'; keep it 'user' for our context.
                 await self.client.beta.threads.messages.create(
-                    thread_id=self.thread_id, role="user", content=message_text
+                    thread_id=self.thread_id, role=role, content=message_text
                 )
             except Exception as e:
                 logger.error("OpenAI queue error: %s", e)
@@ -365,6 +406,199 @@ def start_health_server():
     logger.info("Health server bound to 0.0.0.0:%s", port)
     return server
 
+# ---------- Helpers ----------
+def chunk_text(s: str, limit: int = 1900) -> List[str]:
+    chunks: List[str] = []
+    text = s
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return chunks
+
+async def send_long_followup(interaction: discord.Interaction, content: str, attach_name: Optional[str] = None):
+    if len(content) <= 1900:
+        await interaction.followup.send(content)
+        return
+    for chunk in chunk_text(content):
+        await interaction.followup.send(chunk)
+    if attach_name:
+        bio = io.BytesIO(content.encode("utf-8"))
+        bio.seek(0)
+        await interaction.followup.send(file=discord.File(bio, filename=attach_name))
+
+async def maybe_refresh(timeout_sec: int = 15) -> bool:
+    try:
+        await asyncio.wait_for(refresh_snapshot(), timeout=timeout_sec)
+        return True
+    except asyncio.TimeoutError:
+        logger.warning("refresh_snapshot timed out after %ss", timeout_sec)
+        return False
+    except Exception as e:
+        logger.exception("refresh_snapshot failed: %s", e)
+        return False
+
+# ----- Startup updates: injuries + scores with idempotency markers -----
+MARKER_RE = re.compile(r"\[(injury|score):([^\]]+)\]")
+
+def _sanitize_marker(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9:_\-\.]", "_", s or "")
+
+async def _collect_existing_markers(channel: discord.TextChannel, limit: int = 200) -> Set[str]:
+    """Look back at our last messages and collect markers like [injury:pid:statushash]."""
+    markers: Set[str] = set()
+    try:
+        async for msg in channel.history(limit=limit):
+            if not bot.user or msg.author.id != bot.user.id:
+                continue
+            for m in MARKER_RE.findall(msg.content or ""):
+                markers.add(f"{m[0]}:{m[1]}")
+    except Exception as e:
+        logger.warning("Could not scan channel history for markers: %s", e)
+    return markers
+
+def _is_significant_injury(status: str) -> bool:
+    if not status:
+        return False
+    s = status.upper()
+    # ESPN commonly: QUESTIONABLE, DOUBTFUL, OUT, SUSPENDED, IR, PUP, NFI, DNR
+    return any(k in s for k in ("OUT", "DOUBTFUL", "QUESTIONABLE", "SUSP", "IR", "PUP", "NFI"))
+
+async def _post_injury_updates(channel: discord.TextChannel, existing: Set[str]) -> int:
+    posted = 0
+    for pid, pdata in LEAGUE_SNAPSHOT.get("players", {}).items():
+        inj = pdata.get("injury")
+        if not inj:
+            continue
+        status = (inj.get("status") or "").strip()
+        detail = (inj.get("detail") or "").strip()
+        if not _is_significant_injury(status):
+            continue
+        status_key = _sanitize_marker(status.lower())
+        detail_key = _sanitize_marker(detail.lower())[:32]  # keep marker short
+        marker = f"injury:{pid}:{status_key}:{detail_key}"
+        if marker in existing:
+            continue
+        name = pdata.get("name", f"Player {pid}")
+        team = pdata.get("team", "")
+        pos = pdata.get("position", "")
+        msg = f"🩺 **Injury update** — {name} ({team}, {pos}): **{status}**"
+        if detail:
+            msg += f" — {detail}"
+        msg += f"\n[{marker}]"
+        try:
+            await channel.send(msg)
+            posted += 1
+            existing.add(marker)
+        except Exception as e:
+            logger.warning("Failed to post injury update for %s: %s", name, e)
+    return posted
+
+async def _fetch_scoreboard_json() -> Optional[dict]:
+    if not HTTPX_AVAILABLE:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(SCOREBOARD_URL)
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        logger.warning("Scoreboard fetch failed: %s", e)
+        return None
+
+def _event_status_key(ev: dict) -> Optional[Tuple[str, str, str]]:
+    """Return (event_id, status_type, scoreline) for dedupe."""
+    try:
+        ev_id = str(ev.get("id"))
+        comps = (ev.get("competitions") or [{}])[0]
+        status = (comps.get("status") or {}).get("type") or {}
+        stype = status.get("name") or status.get("state") or "UNKNOWN"
+
+        comps_list = comps.get("competitors") or []
+        if len(comps_list) >= 2:
+            a = comps_list[0]; b = comps_list[1]
+            a_score = str(a.get("score", "0")); b_score = str(b.get("score", "0"))
+            scoreline = f"{a_score}-{b_score}"
+        else:
+            scoreline = "0-0"
+        return (ev_id, stype, scoreline)
+    except Exception:
+        return None
+
+def _event_line(ev: dict) -> Optional[str]:
+    try:
+        comps = (ev.get("competitions") or [{}])[0]
+        teams = comps.get("competitors") or []
+        status = (comps.get("status") or {}).get("type") or {}
+        detail = status.get("shortDetail") or status.get("detail") or status.get("name") or "—"
+
+        if len(teams) >= 2:
+            a, b = teams[0], teams[1]
+            def lab(v):
+                t = v.get("team", {}) or {}
+                abbr = t.get("abbreviation") or t.get("shortDisplayName") or t.get("name") or "??"
+                score = v.get("score", "0")
+                return f"{abbr} {score}"
+            return f"{lab(a)} — {lab(b)} ({detail})"
+        return None
+    except Exception:
+        return None
+
+async def _post_score_updates(channel: discord.TextChannel, existing: Set[str]) -> int:
+    js = await _fetch_scoreboard_json()
+    if not js:
+        return 0
+    events = js.get("events") or []
+    posted = 0
+    for ev in events:
+        key = _event_status_key(ev)
+        if not key:
+            continue
+        ev_id, stype, scoreline = key
+        # Only post on 'in-progress' and 'final' to reduce noise
+        stype_upper = str(stype).upper()
+        if not any(k in stype_upper for k in ("IN_PROGRESS", "STATUS_IN_PROGRESS", "FINAL", "STATUS_FINAL")):
+            continue
+        marker = f"score:{ev_id}:{_sanitize_marker(stype_upper)}:{_sanitize_marker(scoreline)}"
+        if marker in existing:
+            continue
+        line = _event_line(ev)
+        if not line:
+            continue
+        prefix = "🏈 **Score update**" if "IN_PROGRESS" in stype_upper else "🏁 **Final**"
+        msg = f"{prefix} — {line}\n[{marker}]"
+        try:
+            await channel.send(msg)
+            posted += 1
+            existing.add(marker)
+        except Exception as e:
+            logger.warning("Failed to post score update: %s", e)
+    return posted
+
+async def post_startup_updates():
+    """On startup: refresh snapshot, then post new injuries & scores to the updates channel."""
+    if not POST_UPDATES_ON_START:
+        logger.info("Startup updates disabled via POST_UPDATES_ON_START=false")
+        return
+    if not UPDATES_CHANNEL_ID:
+        logger.info("UPDATES_CHANNEL_ID not set; skipping startup updates.")
+        return
+    ch = bot.get_channel(UPDATES_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        logger.warning("UPDATES_CHANNEL_ID=%r not found or not a text channel.", UPDATES_CHANNEL_ID)
+        return
+
+    await maybe_refresh()
+    existing = await _collect_existing_markers(ch, limit=200)
+    inj_posted = await _post_injury_updates(ch, existing)
+    score_posted = await _post_score_updates(ch, existing)
+    logger.info("Startup updates posted: injuries=%d scores=%d", inj_posted, score_posted)
+
 # ---------- Bot ----------
 class FantasyBot(commands.Bot):
     def __init__(self):
@@ -374,7 +608,6 @@ class FantasyBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         try:
-            # Force global sync (guild=None ensures it's global only)
             commands_list = await self.tree.sync(guild=None)
             self.synced = True
             logger.info(f"✅ Global slash commands synced ({len(commands_list)}): {[c.name for c in commands_list]}")
@@ -383,7 +616,7 @@ class FantasyBot(commands.Bot):
 
 bot = FantasyBot()
 
-# ------ Optional memory over regular messages (requires ALLOW_MESSAGE_MEMORY=true) ------
+# ------ Optional memory over regular messages ------
 @bot.event
 async def on_message(message: discord.Message):
     if not ALLOW_MESSAGE_MEMORY:
@@ -409,90 +642,31 @@ def err_embed(msg: str) -> discord.Embed:
 def join_lines(lines: List[str]) -> str:
     return "\n".join(lines)
 
-def league_context_for_ai(max_teams: int = 8) -> str:
-    """
-    Small, neutral context for the assistant: lineup rules + a short view of the league.
-    Keeps it generic; no canned answers.
-    """
-    lineup = ", ".join(f"{k}:{v}" for k, v in LEAGUE_SNAPSHOT.get('lineup', {}).items())
-    last = LEAGUE_SNAPSHOT["meta"].get("last_refresh", "never")
-
-    # Build a lightweight top list (if projections exist)
-    totals = []
-    for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
-        total = compute_team_projection(t)
-        totals.append((t.get("name", f"Team {tid}"), float(total)))
-    totals.sort(key=lambda x: x[1], reverse=True)
-
-    top_lines = []
-    if totals and any(v > 0 for _, v in totals):
-        for name, v in totals[:max_teams]:
-            top_lines.append(f"- {name}: {v:.1f}")
-    else:
-        for tid, t in list(LEAGUE_SNAPSHOT.get("teams", {}).items())[:max_teams]:
-            top_lines.append(f"- {t.get('name', f'Team {tid}')}")
-
-    context = (
-        "You are a helpful fantasy football assistant inside a Discord server.\n"
-        "You have access to a brief league snapshot to ground your answers.\n\n"
-        f"Lineup rules: {lineup}\n"
-        f"Last refresh: {last}\n"
-        "Teams overview:\n" + "\n".join(top_lines)
-    )
-    return context
-
-def chunk_text(s: str, limit: int = 1900) -> List[str]:
-    """Split a long string into Discord-safe chunks."""
-    chunks: List[str] = []
-    text = s
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-        cut = text.rfind("\n", 0, limit)
-        if cut == -1:
-            cut = limit
-        chunks.append(text[:cut])
-        text = text[cut:].lstrip("\n")
-    return chunks
-
-async def send_long_followup(interaction: discord.Interaction, content: str, attach_name: Optional[str] = None):
-    """Safely send long content via followup; chunk and optionally attach a file."""
-    if len(content) <= 1900:
-        await interaction.followup.send(content)
-        return
-    for chunk in chunk_text(content):
-        await interaction.followup.send(chunk)
-    if attach_name:
-        bio = io.BytesIO(content.encode("utf-8"))
-        bio.seek(0)
-        await interaction.followup.send(file=discord.File(bio, filename=attach_name))
-
 # ---------- Commands ----------
 @bot.tree.command(name="sync_cleanup", description="Clear stale guild commands after switching back to global-only.")
 @app_commands.default_permissions(manage_guild=True)
 async def sync_cleanup(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
-        cmds = await bot.tree.sync(guild=None)  # globals authoritative
-        await interaction.followup.send(
-            embed=ok_embed("Sync Cleanup", f"Global commands re-synced ({len(cmds)}). Stale guild commands should clear shortly."),
-            ephemeral=True
-        )
+        await bot.tree.sync(guild=None)
+        await interaction.followup.send(embed=ok_embed("Sync Cleanup", "Global commands re-synced. Stale guild commands should clear shortly."))
     except Exception as e:
-        await interaction.followup.send(embed=err_embed(f"Sync failed: {e}"), ephemeral=True)
+        await interaction.followup.send(embed=err_embed(f"Sync failed: {e}"))
 
 @bot.tree.command(name="ask", description="Ask anything — generic assistant reply with light league context.")
 @app_commands.describe(question="Your question")
 async def ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
-    await refresh_snapshot()
+    await maybe_refresh()
 
     if bot.assistant.enabled:
         try:
-            context = league_context_for_ai(max_teams=8)
-            # Threads API doesn't support 'system' role; push context as a user message.
-            await bot.assistant.add_to_thread(context, role="user")
+            context = (
+                "You are a helpful fantasy football assistant in Discord. "
+                "Answer naturally without canned boilerplate; use general NFL knowledge. "
+                "If you reference this league, do so lightly — you have only a minimal snapshot."
+            )
+            await bot.assistant.add_to_thread(context, role="system")
             await bot.assistant.add_to_thread(question, role="user")
             reply = await bot.assistant.get_reply()
             if not isinstance(reply, str) or not reply.strip():
@@ -504,21 +678,13 @@ async def ask(interaction: discord.Interaction, question: str):
             await interaction.followup.send("Assistant error. Please try again in a moment.")
             return
 
-    missing = []
-    if not OPENAI_API_KEY: missing.append("OPENAI_API_KEY")
-    if not OPENAI_ASSISTANT_ID: missing.append("OPENAI_ASSISTANT_ID")
-    if not OPENAI_THREAD_ID: missing.append("OPENAI_THREAD_ID")
-    msg = (
-        "Generic chat is not enabled because the OpenAI Assistant isn’t configured.\n"
-        "Set these env vars and redeploy: " + (", ".join(missing) if missing else "(missing configuration)")
-    )
-    await interaction.followup.send(msg)
+    await interaction.followup.send("Generic chat isn't configured. Set OPENAI_* env vars to enable.")
 
 @bot.tree.command(name="roster", description="Show a team's roster.")
 @app_commands.describe(team="Team name or manager (partial ok)")
 async def roster(interaction: discord.Interaction, team: str):
     await interaction.response.defer(thinking=True)
-    await refresh_snapshot()
+    await maybe_refresh()
     match_team_id = None
     tlower = team.lower()
     for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
@@ -534,14 +700,16 @@ async def roster(interaction: discord.Interaction, team: str):
         p = LEAGUE_SNAPSHOT["players"].get(pid)
         if not p:
             continue
-        lines.append(f"- {p['name']} ({p['position']}, {p['team']}) proj: {p['projections']:.2f}")
+        inj = p.get("injury")
+        inj_txt = f" — {inj.get('status')}" if inj and inj.get("status") else ""
+        lines.append(f"- {p['name']} ({p['position']}, {p['team']}) proj: {p['projections']:.2f}{inj_txt}")
     await send_long_followup(interaction, "\n".join(lines))
 
 @bot.tree.command(name="whohas", description="Find which team has a player.")
 @app_commands.describe(player="Player name (partial ok)")
 async def whohas(interaction: discord.Interaction, player: str):
     await interaction.response.defer(thinking=True)
-    await refresh_snapshot()
+    await maybe_refresh()
     pl = player.lower()
     for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
         for pid in t.get("players", []):
@@ -551,12 +719,11 @@ async def whohas(interaction: discord.Interaction, player: str):
                 return
     await interaction.followup.send(f"Couldn't find **{player}** in the snapshot.")
 
-# --- Fixed /draftboard: defer + chunk + optional limit ---
 @bot.tree.command(name="draftboard", description="Show the draft board with player names and team abbrev.")
 @app_commands.describe(limit="Max picks to show (optional)")
 async def draftboard(interaction: discord.Interaction, limit: Optional[int] = None):
     await interaction.response.defer(thinking=True)
-    await refresh_snapshot()
+    await maybe_refresh()
     picks = LEAGUE_SNAPSHOT.get("draft", [])
     if not picks:
         await interaction.followup.send("No draft data available.")
@@ -564,20 +731,20 @@ async def draftboard(interaction: discord.Interaction, limit: Optional[int] = No
     ordered = sorted(picks, key=lambda x: x.get("pick", 0))
     if limit is not None and isinstance(limit, int) and limit > 0:
         ordered = ordered[:limit]
-
     lines = ["**Draft Board**"]
     for item in ordered:
         pid = item.get("player_id")
         p = LEAGUE_SNAPSHOT["players"].get(pid, {"name": f"Player {pid}", "team": ""})
         team_abbrev = f" ({p['team']})" if p.get("team") else ""
         lines.append(f"{item.get('pick', '?')}. **{item.get('team_name', 'Team')}** → {p['name']}{team_abbrev}")
+    await send_long_followup(interaction, "\n".join(lines), attach_name="draftboard.txt")
 
-    text = "\n".join(lines)
-    await send_long_followup(interaction, text, attach_name="draftboard.txt")
+@bot.tree.command(name="draftboards", description="Alias of /draftboard.")
+async def draftboards(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    await draftboard.callback(interaction, None)
 
-# Helpers for projections commentary
 def _league_pos_averages() -> Dict[str, float]:
-    """Compute league-average projected points by slot."""
     sums: Dict[str, float] = {"QB": 0.0, "RB": 0.0, "WR": 0.0, "TE": 0.0, "K": 0.0, "FLEX": 0.0}
     n = 0
     for _, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
@@ -602,12 +769,10 @@ def _strength_line(name: str, breakdown: Dict[str, float], avg: Dict[str, float]
         return f"{name}: balanced roster."
     return f"{name}: " + "; ".join(parts) + "."
 
-# --- Upgraded /projections with commentary ---
 @bot.tree.command(name="projections", description="Show team projections league-wide (with commentary).")
 async def projections(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
-    await refresh_snapshot()
-
+    await maybe_refresh()
     totals = []
     breakdowns: Dict[str, Dict[str, float]] = {}
     for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
@@ -617,49 +782,33 @@ async def projections(interaction: discord.Interaction):
     if not totals:
         await interaction.followup.send("No data available. Check your league visibility and LEAGUE_ID/LEAGUE_URL.")
         return
-
     totals.sort(key=lambda x: x[1], reverse=True)
+    if all((v <= 0 for _, v in totals)):
+        msg = (
+            "**Projected Starting Lineup Totals**\n"
+            + "\n".join(f"- {name}: {v:.1f}" for name, v in totals[:8]) +
+            "\n\n_No non-zero projections were returned by ESPN for this league right now._\n"
+            "• If the draft just ended or season week hasn’t started, ESPN may not expose projections yet.\n"
+            "• For guaranteed projections, set `ESPN_S2` and `SWID` cookies (private-mode) or try again later."
+            f"\n\nSnapshot: {LEAGUE_SNAPSHOT['meta'].get('last_refresh','never')}"
+        )
+        await send_long_followup(interaction, msg)
+        return
     avg = _league_pos_averages()
-
-    top8 = totals[:8]
+    top8 = [(n, v) for n, v in totals if v > 0][:8]
     lines = ["**Projected Starting Lineup Totals**", *(f"- {name}: {v:.1f}" for name, v in top8)]
     lines.append("")
     lines.append("**Quick Commentary**")
-
     for name, _v in totals[:3]:
         bl = breakdowns.get(name, {})
         lines.append(f"- {_strength_line(name, bl, avg)}")
-
-    # If assistant is set up, add a short fun blurb
-    if bot.assistant.enabled:
-        try:
-            context = (
-                "Create a short, punchy blurb (2–3 sentences) reacting to these projections. "
-                "Keep it light and avoid inventing specific past matchups. Focus on positional strengths.\n\n"
-                "Top teams and totals:\n" + "\n".join(f"{n}: {v:.1f}" for n, v in totals[:5])
-            )
-            # Push as user messages for Threads API compatibility
-            await bot.assistant.add_to_thread(context, role="user")
-            await bot.assistant.add_to_thread("Give me a fun but grounded summary.", role="user")
-            blurb = await bot.assistant.get_reply()
-            lines.append("")
-            lines.append((blurb or "").strip())
-        except Exception as e:
-            logger.info("Assistant commentary failed: %s", e)
-
     lines.append(f"\nSnapshot: {LEAGUE_SNAPSHOT['meta'].get('last_refresh','never')}")
     await send_long_followup(interaction, "\n".join(lines))
-
-# ✅ Proper alias for /grades with defer
-@bot.tree.command(name="draft_grades", description="Alias of /grades.")
-async def draft_grades(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    await grades.callback(interaction)
 
 @bot.tree.command(name="grades", description="Roster grades with slot breakdown.")
 async def grades(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
-    await refresh_snapshot()
+    await maybe_refresh()
     results = []
     for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
         breakdown = compute_team_breakdown(t)
@@ -667,6 +816,17 @@ async def grades(interaction: discord.Interaction):
         results.append((t["name"], breakdown, total))
     if not results:
         await interaction.followup.send("No league data available.")
+        return
+    if all(r[2] <= 0 for r in results):
+        msg = (
+            "**Roster Grades**\n"
+            + "\n".join(f"- **{name}** → B (proj {total:.1f})" for name, _b, total in sorted(results, key=lambda x: x[2], reverse=True)) +
+            "\n\n_No non-zero projections were returned by ESPN for this league right now._\n"
+            "• If the draft just ended or season week hasn’t started, ESPN may not expose projections yet.\n"
+            "• For guaranteed projections, set `ESPN_S2` and `SWID` cookies (private-mode) or try again later."
+            f"\n\nSnapshot: {LEAGUE_SNAPSHOT['meta'].get('last_refresh','never')}"
+        )
+        await send_long_followup(interaction, msg)
         return
     totals = [r[2] for r in results]
     mean = sum(totals) / len(totals)
@@ -679,7 +839,16 @@ async def grades(interaction: discord.Interaction):
         lines.append(f"- **{name}** → {grade} (proj {total:.1f}, z={z:+.2f}) [{parts}]")
     await send_long_followup(interaction, "\n".join(lines))
 
-# /recap and alias /weekly_report (placeholder stubs; can wire box score parsing later)
+@bot.tree.command(name="draft_grades", description="Alias of /grades.")
+async def draft_grades(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    await grades.callback(interaction)
+
+@bot.tree.command(name="proj", description="Alias of /projections.")
+async def proj(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    await projections.callback(interaction)
+
 @bot.tree.command(name="recap", description="Alias of /weekly_report.")
 async def recap(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
@@ -690,25 +859,25 @@ async def weekly_report(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     await recap.callback(interaction)
 
-# Optional: quick status command for debugging
 @bot.tree.command(name="status", description="Show ESPN connection status & snapshot info.")
 async def status(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
     ready, why = _league_ready()
+    nonzero = sum(1 for _pid, pdata in LEAGUE_SNAPSHOT.get("players", {}).items() if (pdata.get("projections") or 0) > 0)
+    inj_count = sum(1 for _pid, pdata in LEAGUE_SNAPSHOT.get("players", {}).items() if pdata.get("injury"))
     lines = [
         f"League ID: {LEAGUE_ID or 'missing'} | Year: {YEAR}",
         f"Snapshot last refresh: {LEAGUE_SNAPSHOT['meta'].get('last_refresh', 'never')}",
+        f"Teams: {len(LEAGUE_SNAPSHOT.get('teams', {}))} | Players: {len(LEAGUE_SNAPSHOT.get('players', {}))} | Non-zero projections: {nonzero} | Injuries found: {inj_count}",
         f"Ready: {'yes' if ready else 'no'}{f' — {why}' if not ready else ''}",
     ]
-    await interaction.followup.send("\n".join(lines), ephemeral=True)
+    await interaction.followup.send("\n".join(lines))
 
 # -------- Background: live refresh --------
 @tasks.loop(minutes=10)
 async def auto_refresh_snapshot():
-    """Refresh ESPN data every 10m on game days, every 2h otherwise."""
     now = dt.datetime.now(dt.timezone.utc)
-    dow = now.weekday()  # Monday=0, Sunday=6
-    # Tue (1), Wed (2), Fri (4), Sat (5) → only refresh at even hours
+    dow = now.weekday()
     if dow in (1, 2, 4, 5):
         if now.hour % 2 != 0:
             return
@@ -718,7 +887,6 @@ async def auto_refresh_snapshot():
 async def before_auto_refresh():
     await bot.wait_until_ready()
 
-# Provide a default heartbeat too
 @tasks.loop(minutes=30)
 async def heartbeat():
     logger.info("Heartbeat: bot alive at %s", dt.datetime.now(dt.timezone.utc).isoformat())
@@ -731,17 +899,20 @@ async def before_heartbeat():
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
-    logger.info("Config check: LEAGUE_ID=%r YEAR=%s", LEAGUE_ID, YEAR)
+    logger.info("Config check: LEAGUE_ID=%r YEAR=%s | UPDATES_CHANNEL_ID=%r", LEAGUE_ID, YEAR, UPDATES_CHANNEL_ID)
 
     if not heartbeat.is_running():
         heartbeat.start()
     if not auto_refresh_snapshot.is_running():
         auto_refresh_snapshot.start()
 
-    # Refresh ESPN snapshot immediately
     await refresh_snapshot(force=True)
+    # Post startup injuries/scores (idempotent)
+    try:
+        await post_startup_updates()
+    except Exception as e:
+        logger.warning("Startup updates failed: %s", e)
 
-    # Debug: log which commands are registered
     try:
         commands_list = await bot.tree.fetch_commands()
         logger.info(f"🔎 Slash commands loaded ({len(commands_list)}): {[c.name for c in commands_list]}")
@@ -752,6 +923,5 @@ if __name__ == "__main__":
     if BOT_TOKEN == "REPLACE_ME":
         logger.warning("DISCORD_TOKEN env var not set. Please set it before running.")
     else:
-        # Bind a tiny HTTP server so Render Web Service sees an open port
         _server = start_health_server()
         bot.run(BOT_TOKEN)

@@ -42,6 +42,10 @@ POST_SCORES = os.getenv("POST_SCORES", "true").lower() == "true"
 POST_INJURIES = os.getenv("POST_INJURIES", "true").lower() == "true"
 STATE_PATH = os.getenv("STATE_PATH", "state.json")
 
+# New: tune injury posting behavior (env-configurable)
+INJURY_POST_LIMIT = int(os.getenv("INJURY_POST_LIMIT", "25"))  # how many injuries to post at startup
+INJURY_MAX_DAYS = int(os.getenv("INJURY_MAX_DAYS", "5"))       # only post injuries within N days
+
 # httpx for ESPN site APIs
 try:
     import httpx
@@ -457,9 +461,9 @@ def _format_score_line(event: dict) -> Optional[str]:
         as_ = int(away.get("score") or 0)
 
         if state == "post":
-            return f"🏁 Final: {an} {as_} — {hn} {hs} [#score {event.get('id')}]"
+            return f"🏁 Final: {an} {as_} — {hn} {hs}"
         elif state == "in":
-            return f"⏱️ Live (Q{period} {clock}): {an} {as_} — {hn} {hs} [#score {event.get('id')}]"
+            return f"⏱️ Live (Q{period} {clock}): {an} {as_} — {hn} {hs}"
         else:
             # pre-game, only post once when it goes live/final; we skip at startup
             return None
@@ -472,12 +476,25 @@ def _format_injury_line(team: dict, item: dict) -> Optional[str]:
         ath = (item.get("athlete") or {})
         aname = ath.get("displayName") or ath.get("shortName") or "Player"
         pos = (ath.get("position") or {}).get("abbreviation") or ""
-        info = (item.get("type") or {}).get("text") or (item.get("type") or {}).get("name") or item.get("status") or "Injury"
-        detail = item.get("detail") or ""
-        # Hidden marker for dedupe
+        typ = (item.get("type") or {})
+        type_text = typ.get("text") or typ.get("name") or ""       # e.g., "Calf"
+        status_text = item.get("status") or ""                     # e.g., "Questionable", "Out"
+        detail = item.get("detail") or ""                          # free text detail if present
+
+        # Prefer explicit game designation; fallback to type
+        designation = status_text or type_text or "Injury"
+
+        # If we have both, show designation and (type) once (avoid duplication)
+        extra = f" ({type_text})" if type_text and (status_text.lower() if status_text else "") not in type_text.lower() else ""
+        detail_part = f" {detail}" if detail else ""
+
+        # Hidden marker for dedupe (injuries only)
         aid = ath.get("id") or "0"
         when = (item.get("date") or "")[:19]
-        return f"🩺 {tname}: {aname} ({pos}) — {info}. {detail} [#inj {aid}:{when}]"
+
+        # Example:
+        # 🩺 49ers: Christian McCaffrey (RB) — Questionable (Calf). Limited Thursday.
+        return f"🩺 {tname}: {aname} ({pos}) — {designation}{extra}.{detail_part} [#inj {aid}:{when}]"
     except Exception:
         return None
 
@@ -488,7 +505,7 @@ async def _post_startup_scores(ch: discord.TextChannel):
     if not data:
         return
     events = data.get("events") or []
-    lines: List[str] = []
+    lines: List[Tuple[str, str]] = []
     for ev in events:
         key = _score_key(ev)
         if not key or _state_has("scores", key):
@@ -510,28 +527,41 @@ async def _post_startup_injuries(ch: discord.TextChannel):
     if not data:
         return
     teams = data.get("teams") or []
-    lines: List[Tuple[str, str]] = []
+    collected: List[Tuple[str, str, dt.datetime]] = []
+    now_utc = dt.datetime.now(dt.timezone.utc)
+
     for team in teams:
         for it in team.get("injuries", []) or []:
             key = _injury_key(team, it)
             if not key or _state_has("injuries", key):
                 continue
+
+            # recency gate
+            when_raw = it.get("date")
+            dt_when = None
+            with contextlib.suppress(Exception):
+                if when_raw:
+                    dt_when = dt.datetime.fromisoformat(when_raw.replace("Z", "+00:00"))
+
+            recent_ok = True
+            if dt_when:
+                if (now_utc - dt_when).days > INJURY_MAX_DAYS:
+                    recent_ok = False
+
+            if not recent_ok:
+                continue
+
             line = _format_injury_line(team, it)
             if not line:
                 continue
-            # only pick relatively recent (last 3 days)
-            when = it.get("date")
-            recent_ok = True
-            with contextlib.suppress(Exception):
-                if when:
-                    dt_when = dt.datetime.fromisoformat(when.replace("Z", "+00:00"))
-                    if (dt.datetime.now(dt.timezone.utc) - dt_when).days > 3:
-                        recent_ok = False
-            if recent_ok:
-                lines.append((key, line))
 
-    # Limit initial flood
-    for key, line in lines[:15]:
+            collected.append((key, line, dt_when or dt.datetime.min.replace(tzinfo=dt.timezone.utc)))
+
+    # newest first so stars don’t get buried
+    collected.sort(key=lambda x: x[2], reverse=True)
+
+    # Limit initial flood (env configurable)
+    for key, line, _ in collected[:INJURY_POST_LIMIT]:
         await ch.send(line)
         _state_add("injuries", key)
 
@@ -550,15 +580,7 @@ async def startup_alerts():
                 if m.author.id != (bot.user.id if bot.user else 0):
                     continue
                 if m.content:
-                    if "#score " in m.content:
-                        # extract the id
-                        mkey = None
-                        m = m.content
-                        idx = m.find("#score ")
-                        if idx != -1:
-                            mkey = m[idx:].split()[-1].strip("[](){}<>")
-                            if mkey.isdigit():
-                                _state_add("scores", f"score:{mkey}")
+                    # Score rehydrate used to look for "#score", but we've removed score tags from output by request.
                     if "#inj " in m.content:
                         idx = m.content.find("#inj ")
                         if idx != -1:

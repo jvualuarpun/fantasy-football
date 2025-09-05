@@ -504,7 +504,7 @@ async def _post_startup_scores(ch: discord.TextChannel):
     if posted:
         logger.info("Posted %s score lines", posted)
 
-# ---------- Injuries (ESPN Core API) ----------
+# ---------- Injuries (ESPN Core API + HTML fallback) ----------
 CORE_BASE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
 
 ALLOWED_POS = {"QB", "RB", "WR", "TE", "K"}
@@ -512,10 +512,30 @@ PRIORITY_KEYS = {"questionable", "doubtful", "out", "inactive", "probable"}
 
 TEAM_CORE_MAP: Dict[str, Tuple[str, str]] = {}  # "SF" -> ("25", "San Francisco 49ers")  (id, displayName)
 
+# Optional BeautifulSoup (HTML fallback)
+try:
+    from bs4 import BeautifulSoup  # pip install beautifulsoup4
+    _BS4 = True
+except Exception as e:
+    _BS4 = False
+    logger.warning("beautifulsoup4 unavailable: %s", e)
+
+async def _fetch_text(url: str) -> Optional[str]:
+    if not _HTTPX:
+        return None
+    try:
+        async with _ESPN_SEM:
+            async with httpx.AsyncClient(timeout=20, headers=DEFAULT_HEADERS) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                return r.text
+    except Exception as e:
+        logger.info("Fetch text failed %s: %s", url, e)
+        return None
+
 async def _build_team_map() -> None:
     """
     Build abbr -> (id, displayName) from Core API.
-    Uses _fetch_json per request so we never re-use a closed client.
     """
     if not _HTTPX:
         return
@@ -542,7 +562,7 @@ async def _build_team_map() -> None:
 
     await asyncio.gather(*[fetch_team(it) for it in items])
 
-    # Helpful aliases (some leagues use WAS vs WSH)
+    # Helpful alias (some places still use WAS)
     if "WSH" in TEAM_CORE_MAP and "WAS" not in TEAM_CORE_MAP:
         TEAM_CORE_MAP["WAS"] = TEAM_CORE_MAP["WSH"]
 
@@ -576,15 +596,14 @@ def _inj_key(team_abbr: str, athlete_id: str, when: Optional[dt.datetime], desig
     return f"inj:{team_abbr}:{athlete_id}:{ts}:{designation}"
 
 def _fmt_injury_line(team_name: str, player_name: str, pos: str, designation: str, inj_type: str, detail: str, athlete_id: str, when: Optional[dt.datetime]) -> str:
-    extra = f" ({inj_type})" if inj_type and designation.lower() not in inj_type.lower() else ""
+    extra = f" ({inj_type})" if inj_type and designation.lower() not in (inj_type or "").lower() else ""
     detail_part = f" {detail}" if detail else ""
     when_str = (when.isoformat()[:19] if isinstance(when, dt.datetime) else "na")
     return f"🩺 {team_name}: {player_name} ({pos}) — {designation}{extra}.{detail_part} [#inj {athlete_id}:{when_str}]"
 
 async def _fetch_athlete_bundle(ref: str) -> Tuple[str, str]:
     """
-    Returns (displayName, positionAbbr).
-    Uses per-call client to avoid reusing a closed session.
+    Returns (displayName, positionAbbr) from Core API.
     """
     a = await _fetch_json(ref)
     if not a:
@@ -604,9 +623,7 @@ async def _fetch_athlete_bundle(ref: str) -> Tuple[str, str]:
 
 async def _fetch_team_injuries_core(team_abbr: str, team_id: str, team_name: str) -> List[dict]:
     """
-    Returns normalized injury dicts:
-      { 'team': team_name, 'abbrev': team_abbr, 'athlete_id': str, 'name': str,
-        'pos': str, 'designation': str, 'type': str, 'detail': str, 'when': datetime|None }
+    Core API team injuries -> normalized items.
     """
     if not _HTTPX:
         return []
@@ -664,25 +681,127 @@ async def _fetch_team_injuries_core(team_abbr: str, team_id: str, team_name: str
             "when": when,
         })
 
-    # Limit concurrency for the per-item detail fetches
     await asyncio.gather(*[fetch_one(it) for it in items])
-
     return out
 
-async def _scrape_all_injuries_core() -> List[dict]:
+# ---------- HTML fallback (team page) ----------
+def _extract_text(el) -> str:
+    try:
+        return " ".join(el.get_text(" ", strip=True).split())
+    except Exception:
+        return ""
+
+async def _scrape_team_injuries_html(team_abbr: str, team_name: str) -> List[dict]:
+    """
+    Scrape https://www.espn.com/nfl/team/injuries/_/name/{abbr}
+    Returns normalized items; filters to ALLOWED_POS.
+    """
+    if not (_HTTPX and _BS4):
+        return []
+    url = f"https://www.espn.com/nfl/team/injuries/_/name/{team_abbr.lower()}"
+    html = await _fetch_text(url)
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    # ESPN uses generic 'Table' components. Grab all tables and detect headers.
+    tables = soup.select("table.Table")
+    items: List[dict] = []
+
+    for tbl in tables:
+        # Build header index map
+        header_cells = tbl.select("thead tr th")
+        if not header_cells:
+            continue
+        headers = [(_extract_text(th) or "").lower() for th in header_cells]
+        # Expect columns like PLAYER | POS | INJURY | STATUS (or similar)
+        try:
+            i_player = headers.index("player")
+            i_pos = headers.index("pos")
+        except ValueError:
+            continue
+        # injury/status headers can vary slightly; try to locate them
+        def _find_header_idx(names):
+            for n in names:
+                if n in headers:
+                    return headers.index(n)
+            return None
+
+        i_injury = _find_header_idx({"injury", "injuries", "report"})
+        i_status = _find_header_idx({"status", "game status"})
+
+        body_rows = tbl.select("tbody tr")
+        for tr in body_rows:
+            tds = tr.find_all("td")
+            if not tds or len(tds) < max(i_player, i_pos) + 1:
+                continue
+            player_name = _extract_text(tds[i_player])
+            pos = _extract_text(tds[i_pos]).upper()
+            if not _pos_ok(pos):
+                continue
+            inj_type = _extract_text(tds[i_injury]) if (i_injury is not None and i_injury < len(tds)) else ""
+            status = _extract_text(tds[i_status]) if (i_status is not None and i_status < len(tds)) else ""
+            designation = _designation_from_text(status, inj_type) or (status or "Injury")
+
+            items.append({
+                "team": team_name,
+                "abbrev": team_abbr,
+                "athlete_id": player_name.lower().replace(" ", "-"),  # no id on HTML page; use slug
+                "name": player_name or "Player",
+                "pos": pos or "",
+                "designation": designation,
+                "type": inj_type or "",
+                "detail": "",   # HTML table usually doesn’t have a long comment; leave blank
+                "when": None,   # No timestamp on HTML page
+            })
+
+    return items
+
+async def _scrape_all_injuries_combined() -> List[dict]:
+    """
+    Try Core API first. For any team that yields 0 items (or overall 0),
+    scrape HTML and merge. Filtered to fantasy positions already.
+    """
     await _build_team_map()
     if not TEAM_CORE_MAP:
         logger.warning("Team mapping not available; skipping injuries.")
         return []
-    results = await asyncio.gather(
+
+    # Core API first
+    core_by_team: Dict[str, List[dict]] = {abbr: [] for abbr in TEAM_CORE_MAP.keys()}
+    core_results = await asyncio.gather(
         *[_fetch_team_injuries_core(abbr, tid, name) for abbr, (tid, name) in TEAM_CORE_MAP.items()],
         return_exceptions=True
     )
-    items: List[dict] = []
-    for r in results:
-        if isinstance(r, list):
-            items.extend(r)
-    return items
+    for (abbr, (_tid, name)), res in zip(TEAM_CORE_MAP.items(), core_results):
+        if isinstance(res, list):
+            core_by_team[abbr] = res
+
+    # If nothing (or very sparse), fall back to HTML for those teams
+    html_needed = [abbr for abbr, items in core_by_team.items() if not items]
+    html_results: Dict[str, List[dict]] = {abbr: [] for abbr in html_needed}
+    if html_needed:
+        if not _BS4:
+            logger.info("HTML fallback requested for %d teams but BeautifulSoup not available.", len(html_needed))
+        else:
+            html_fetches = []
+            for abbr in html_needed:
+                name = TEAM_CORE_MAP[abbr][1]
+                html_fetches.append(_scrape_team_injuries_html(abbr, name))
+            html_lists = await asyncio.gather(*html_fetches, return_exceptions=True)
+            for abbr, res in zip(html_needed, html_lists):
+                if isinstance(res, list):
+                    html_results[abbr] = res
+
+    # Merge: prefer Core items when present; otherwise HTML items.
+    merged: List[dict] = []
+    for abbr in TEAM_CORE_MAP.keys():
+        if core_by_team.get(abbr):
+            merged.extend(core_by_team[abbr])
+        elif html_results.get(abbr):
+            merged.extend(html_results[abbr])
+
+    return merged
 
 def _is_priority(designation: str) -> bool:
     return (designation or "").lower() in PRIORITY_KEYS
@@ -690,9 +809,9 @@ def _is_priority(designation: str) -> bool:
 async def _post_injuries(ch: discord.TextChannel):
     if not POST_INJURIES:
         return
-    items = await _scrape_all_injuries_core()
+    items = await _scrape_all_injuries_combined()
     if not items:
-        logger.info("No injuries from Core API.")
+        logger.info("No injuries found via Core API or HTML.")
         return
 
     now_utc = dt.datetime.now(dt.timezone.utc)
@@ -715,13 +834,14 @@ async def _post_injuries(ch: discord.TextChannel):
             when
         )
 
-        # Recency
-        days_limit = INJURY_MAX_DAYS_Q if _is_priority(designation) else INJURY_MAX_DAYS
-        if when and (now_utc - when).days > days_limit:
-            continue
+        # Recency filters: HTML has no timestamps, so allow posting (treated as "fresh").
+        if when:
+            days_limit = INJURY_MAX_DAYS_Q if _is_priority(designation) else INJURY_MAX_DAYS
+            if (now_utc - when).days > days_limit:
+                continue
 
         bucket = priority if _is_priority(designation) else regular
-        bucket.append((key, line, when or dt.datetime.min.replace(tzinfo=dt.timezone.utc)))
+        bucket.append((key, line, when or now_utc))
 
     priority.sort(key=lambda x: x[2], reverse=True)
     regular.sort(key=lambda x: x[2], reverse=True)
@@ -750,60 +870,8 @@ async def _post_injuries(ch: discord.TextChannel):
         _state_add("injuries", key)
         posted += 1
 
-    logger.info("Injuries: scanned=%s, posted=%s (priority=%s, regular up to %s)",
-                len(items), posted, min(len(priority), INJURY_PRIORITY_LIMIT), remaining)
+    logger.info("Injuries combined: posted %s (priority up to %s, regular up to %s)", posted, INJURY_PRIORITY_LIMIT, remaining)
 
-# ---------- Startup / Poll orchestration ----------
-async def _get_alert_channel() -> Optional[discord.TextChannel]:
-    if not ALERT_CHANNEL_ID:
-        return None
-    ch = bot.get_channel(ALERT_CHANNEL_ID)
-    if ch is None:
-        with contextlib.suppress(Exception):
-            ch = await bot.fetch_channel(ALERT_CHANNEL_ID)
-    if isinstance(ch, discord.TextChannel):
-        return ch
-    return None
-
-async def startup_alerts():
-    ch = await _get_alert_channel()
-    if not ch:
-        if ALERT_CHANNEL_ID:
-            logger.warning("ALERT_CHANNEL_ID=%s not found or not a text channel.", ALERT_CHANNEL_ID)
-        else:
-            logger.info("ALERT_CHANNEL_ID not set; skipping startup alerts.")
-        return
-
-    # Rehydrate dedupe from recent history for injuries
-    if ALLOW_MESSAGE_MEMORY:
-        with contextlib.suppress(Exception):
-            async for m in ch.history(limit=400):
-                if m.author.id != (bot.user.id if bot.user else 0):
-                    continue
-                if m.content and "#inj " in m.content:
-                    idx = m.content.find("#inj ")
-                    if idx != -1:
-                        tail = m.content[idx + 5:].split("]")[0].strip()
-                        if tail:
-                            _state_add("injuries", f"inj:{tail}")
-
-    await _post_startup_scores(ch)
-    await _post_injuries(ch)
-
-@tasks.loop(minutes=15)
-async def poll_alerts():
-    try:
-        ch = await _get_alert_channel()
-        if not ch:
-            return
-        await _post_startup_scores(ch)
-        await _post_injuries(ch)
-    except Exception as e:
-        logger.info("poll_alerts error: %s", e)
-
-@poll_alerts.before_loop
-async def before_poll_alerts():
-    await bot.wait_until_ready()
 
 # ---------- Bot ----------
 class FantasyBot(commands.Bot):

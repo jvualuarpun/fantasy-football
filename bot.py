@@ -405,32 +405,23 @@ DEFAULT_HEADERS = {
     "Accept-Language": os.getenv("HTTP_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
 }
 
+# Concurrency limiter so we don’t hammer ESPN and to avoid too many open connections.
+_ESPN_CONCURRENCY = int(os.getenv("ESPN_CONCURRENCY", "6"))
+_ESPN_SEM = asyncio.Semaphore(_ESPN_CONCURRENCY)
+
 async def _fetch_json(url: str) -> Optional[dict]:
+    """
+    Fetch JSON with its own AsyncClient (prevents 'client closed' errors).
+    Uses a global semaphore to limit concurrent requests.
+    """
     if not _HTTPX:
         return None
     try:
-        async with httpx.AsyncClient(timeout=20, headers=DEFAULT_HEADERS) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            return r.json()
-    except Exception as e:
-        logger.info("Fetch failed %s: %s", url, e)
-        return None
-
-async def _get_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
-    try:
-        r = await client.get(url, timeout=20, headers=DEFAULT_HEADERS)
-        r.raise_for_status()
-        return r.text
-    except Exception as e:
-        logger.info("Fetch text failed %s: %s", url, e)
-        return None
-
-async def _get_json(client: httpx.AsyncClient, url: str) -> Optional[dict]:
-    try:
-        r = await client.get(url, timeout=20, headers=DEFAULT_HEADERS)
-        r.raise_for_status()
-        return r.json()
+        async with _ESPN_SEM:
+            async with httpx.AsyncClient(timeout=20, headers=DEFAULT_HEADERS) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                return r.json()
     except Exception as e:
         logger.info("Fetch json failed %s: %s", url, e)
         return None
@@ -522,38 +513,38 @@ PRIORITY_KEYS = {"questionable", "doubtful", "out", "inactive", "probable"}
 TEAM_CORE_MAP: Dict[str, Tuple[str, str]] = {}  # "SF" -> ("25", "San Francisco 49ers")  (id, displayName)
 
 async def _build_team_map() -> None:
-    """Build abbr -> (id, displayName) from Core API."""
+    """
+    Build abbr -> (id, displayName) from Core API.
+    Uses _fetch_json per request so we never re-use a closed client.
+    """
     if not _HTTPX:
         return
     if TEAM_CORE_MAP:
         return
-    async with httpx.AsyncClient(timeout=20, headers=DEFAULT_HEADERS) as client:
-        teams_idx = await _get_json(client, f"{CORE_BASE}/teams?limit=100")
-        if not teams_idx:
-            logger.warning("Failed to load team index for injuries.")
+    teams_idx = await _fetch_json(f"{CORE_BASE}/teams?limit=100")
+    if not teams_idx:
+        logger.warning("Failed to load team index for injuries.")
+        return
+    items = teams_idx.get("items") or []
+
+    async def fetch_team(item):
+        ref = item.get("$ref") or item
+        if not isinstance(ref, str):
             return
-        items = teams_idx.get("items") or []
-        sem = asyncio.Semaphore(8)
+        t = await _fetch_json(ref)
+        if not t:
+            return
+        abbr = (t.get("abbreviation") or t.get("shortDisplayName") or "").upper()
+        disp = t.get("displayName") or abbr or "Team"
+        tid = str(t.get("id") or "").strip()
+        if abbr and tid:
+            TEAM_CORE_MAP[abbr] = (tid, disp)
 
-        async def fetch_team(item):
-            ref = item.get("$ref") or item
-            if not isinstance(ref, str):
-                return
-            async with sem:
-                t = await _get_json(client, ref)
-            if not t:
-                return
-            abbr = (t.get("abbreviation") or t.get("shortDisplayName") or "").upper()
-            disp = t.get("displayName") or abbr or "Team"
-            tid = str(t.get("id") or "").strip()
-            if abbr and tid:
-                TEAM_CORE_MAP[abbr] = (tid, disp)
+    await asyncio.gather(*[fetch_team(it) for it in items])
 
-        await asyncio.gather(*[fetch_team(it) for it in items])
-
-        # Helpful aliases (some leagues use WAS vs WSH)
-        if "WSH" in TEAM_CORE_MAP and "WAS" not in TEAM_CORE_MAP:
-            TEAM_CORE_MAP["WAS"] = TEAM_CORE_MAP["WSH"]
+    # Helpful aliases (some leagues use WAS vs WSH)
+    if "WSH" in TEAM_CORE_MAP and "WAS" not in TEAM_CORE_MAP:
+        TEAM_CORE_MAP["WAS"] = TEAM_CORE_MAP["WSH"]
 
 def _pos_ok(p: str) -> bool:
     return (p or "").upper() in ALLOWED_POS
@@ -590,18 +581,19 @@ def _fmt_injury_line(team_name: str, player_name: str, pos: str, designation: st
     when_str = (when.isoformat()[:19] if isinstance(when, dt.datetime) else "na")
     return f"🩺 {team_name}: {player_name} ({pos}) — {designation}{extra}.{detail_part} [#inj {athlete_id}:{when_str}]"
 
-async def _fetch_athlete_bundle(client: httpx.AsyncClient, ref: str) -> Tuple[str, str]:
+async def _fetch_athlete_bundle(ref: str) -> Tuple[str, str]:
     """
-    Returns (displayName, positionAbbr)
+    Returns (displayName, positionAbbr).
+    Uses per-call client to avoid reusing a closed session.
     """
-    a = await _get_json(client, ref)
+    a = await _fetch_json(ref)
     if not a:
         return "Player", ""
     name = a.get("displayName") or a.get("shortName") or "Player"
     pos_abbr = ""
     pos = a.get("position")
     if isinstance(pos, dict) and pos.get("$ref"):
-        pos_json = await _get_json(client, pos["$ref"])
+        pos_json = await _fetch_json(pos["$ref"])
         if pos_json:
             pos_abbr = (pos_json.get("abbreviation") or "").upper()
     elif isinstance(pos, dict):
@@ -620,63 +612,60 @@ async def _fetch_team_injuries_core(team_abbr: str, team_id: str, team_name: str
         return []
     url = f"{CORE_BASE}/teams/{team_id}/injuries"
     out: List[dict] = []
-    async with httpx.AsyncClient(timeout=20, headers=DEFAULT_HEADERS) as client:
-        idx = await _get_json(client, url)
-        if not idx:
-            return out
-        items = idx.get("items") or []
+    idx = await _fetch_json(url)
+    if not idx:
+        return out
+    items = idx.get("items") or []
 
-        sem = asyncio.Semaphore(10)
+    async def fetch_one(item):
+        ref = item.get("$ref") or item
+        if not isinstance(ref, str):
+            return
+        inj = await _fetch_json(ref)
+        if not inj:
+            return
 
-        async def fetch_one(item):
-            ref = item.get("$ref") or item
-            if not isinstance(ref, str):
-                return
-            async with sem:
-                inj = await _get_json(client, ref)
-            if not inj:
-                return
+        # athlete
+        athlete_ref = ""
+        athlete_id = ""
+        athlete_name = "Player"
+        pos_abbr = ""
+        if isinstance(inj.get("athlete"), dict):
+            athlete_ref = inj["athlete"].get("$ref") or ""
+            m = re.search(r"/athletes/(\d+)", athlete_ref or "")
+            if m:
+                athlete_id = m.group(1)
+        if athlete_ref:
+            try:
+                athlete_name, pos_abbr = await _fetch_athlete_bundle(athlete_ref)
+            except Exception:
+                pass
 
-            # athlete
-            athlete_ref = ""
-            athlete_id = ""
-            athlete_name = "Player"
-            pos_abbr = ""
-            if isinstance(inj.get("athlete"), dict):
-                athlete_ref = inj["athlete"].get("$ref") or ""
-                m = re.search(r"/athletes/(\d+)", athlete_ref)
-                if m:
-                    athlete_id = m.group(1)
-            if athlete_ref:
-                try:
-                    athlete_name, pos_abbr = await _fetch_athlete_bundle(client, athlete_ref)
-                except Exception:
-                    pass
+        # ignore non-fantasy positions
+        if not _pos_ok(pos_abbr):
+            return
 
-            # ignore non-fantasy positions
-            if not _pos_ok(pos_abbr):
-                return
+        # designation / type / detail / date
+        status = inj.get("status") or inj.get("statusText") or ""
+        inj_type = inj.get("type") or inj.get("injury") or ""
+        detail = inj.get("shortComment") or inj.get("comment") or inj.get("longComment") or inj.get("description") or ""
+        when = _parse_dt_guess(inj.get("date") or inj.get("lastUpdated") or inj.get("statusUpdated") or inj.get("statusDate"))
 
-            # designation / type / detail / date
-            status = inj.get("status") or inj.get("statusText") or ""
-            inj_type = inj.get("type") or inj.get("injury") or ""
-            detail = inj.get("shortComment") or inj.get("comment") or inj.get("longComment") or inj.get("description") or ""
-            when = _parse_dt_guess(inj.get("date") or inj.get("lastUpdated") or inj.get("statusUpdated") or inj.get("statusDate"))
+        designation = _designation_from_text(status, inj_type, detail) or (status or "Injury")
+        out.append({
+            "team": team_name,
+            "abbrev": team_abbr,
+            "athlete_id": athlete_id or athlete_name.lower().replace(" ", "-"),
+            "name": athlete_name,
+            "pos": pos_abbr,
+            "designation": designation,
+            "type": inj_type or "",
+            "detail": detail or "",
+            "when": when,
+        })
 
-            designation = _designation_from_text(status, inj_type, detail) or (status or "Injury")
-            out.append({
-                "team": team_name,
-                "abbrev": team_abbr,
-                "athlete_id": athlete_id or athlete_name.lower().replace(" ", "-"),
-                "name": athlete_name,
-                "pos": pos_abbr,
-                "designation": designation,
-                "type": inj_type or "",
-                "detail": detail or "",
-                "when": when,
-            })
-
-        await asyncio.gather(*[fetch_one(it) for it in items])
+    # Limit concurrency for the per-item detail fetches
+    await asyncio.gather(*[fetch_one(it) for it in items])
 
     return out
 
@@ -685,10 +674,10 @@ async def _scrape_all_injuries_core() -> List[dict]:
     if not TEAM_CORE_MAP:
         logger.warning("Team mapping not available; skipping injuries.")
         return []
-    tasks = []
-    for abbr, (tid, name) in TEAM_CORE_MAP.items():
-        tasks.append(_fetch_team_injuries_core(abbr, tid, name))
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(
+        *[_fetch_team_injuries_core(abbr, tid, name) for abbr, (tid, name) in TEAM_CORE_MAP.items()],
+        return_exceptions=True
+    )
     items: List[dict] = []
     for r in results:
         if isinstance(r, list):

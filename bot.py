@@ -155,6 +155,63 @@ LEAGUE_SNAPSHOT: Dict[str, dict] = {
     "draft": [],
 }
 
+# --- Week + stats helpers (paste right after LEAGUE_SNAPSHOT) ---
+
+def _detect_current_week_from_league(lg) -> int:
+    # Try env override first: WEEK=##
+    try:
+        w = int(os.getenv("WEEK", "0"))
+        if w > 0:
+            return w
+    except Exception:
+        pass
+    # Fall back to league property
+    for attr in ("current_week", "currentWeek"):
+        if hasattr(lg, attr):
+            try:
+                w = int(getattr(lg, attr))
+                if w > 0:
+                    return w
+            except Exception:
+                pass
+    return 1  # safe default
+
+def _extract_week_points(p, week: int, source_id: int) -> float:
+    """
+    Read a player's total for a given week from espn_api stats.
+      source_id 0 = ACTUAL, 1 = PROJECTED
+    Tries common attribute names used by espn_api.
+    """
+    try:
+        for s in getattr(p, "stats", []) or []:
+            sp = (
+                getattr(s, "scoring_period", None)
+                or getattr(s, "scoringPeriodId", None)
+                or getattr(s, "scoringPeriod", None)
+            )
+            try:
+                sp_i = int(sp)
+            except Exception:
+                sp_i = None
+            if sp_i == int(week):
+
+                sid = (
+                    getattr(s, "stat_source_id", None)
+                    or getattr(s, "statSourceId", None)
+                    or getattr(s, "source_id", None)
+                )
+                if sid == source_id:
+                    val = (
+                        getattr(s, "applied_total", None)
+                        or getattr(s, "appliedTotal", None)
+                        or getattr(s, "points", None)
+                        or getattr(s, "projected_points", None)
+                    )
+                    return float(val or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
 def format_lineup_counts(snapshot: dict) -> str:
     parts = [f"{pos}: {cnt}" for pos, cnt in snapshot.get("lineup", {}).items()]
     return "\n".join(parts)
@@ -180,6 +237,8 @@ async def refresh_snapshot(force: bool = False) -> None:
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     try:
         lg = League(league_id=int(LEAGUE_ID), year=YEAR)
+        current_week = _detect_current_week_from_league(lg)
+        LEAGUE_SNAPSHOT["meta"]["current_week"] = current_week
 
         teams_map: Dict[str, dict] = {}
         players_map: Dict[str, dict] = {}
@@ -192,18 +251,18 @@ async def refresh_snapshot(force: bool = False) -> None:
                 pid = _safe_str(getattr(p, "playerId", None) or getattr(p, "id", None) or getattr(p, "name", ""))
                 team_abbrev = getattr(p, "proTeam", "") or getattr(p, "proTeamAbbreviation", "") or ""
                 pos = getattr(p, "position", "") or (getattr(p, "eligibleSlots", [""])[0] if getattr(p, "eligibleSlots", None) else "")
-                proj = 0.0
-                with contextlib.suppress(Exception):
-                    stats = getattr(p, "stats", []) or []
-                    for s in stats:
-                        if getattr(s, "projected_points", None) is not None:
-                            proj = float(s.projected_points)
-                            break
+
+                # --- new: capture projections & actual points for current week
+                proj_week = _extract_week_points(p, current_week, source_id=1)  # projected this week
+                pts_week  = _extract_week_points(p, current_week, source_id=0)  # actual this week
+
                 players_map[pid] = {
                     "name": getattr(p, "name", f"Player {pid}"),
                     "team": team_abbrev,
                     "position": pos,
-                    "projections": proj,
+                    "projections": proj_week,   # keep legacy key for old code paths
+                    "proj_week": proj_week,
+                    "pts_week": pts_week,
                 }
                 roster_ids.append(pid)
             teams_map[str(team_id)] = {"name": team_name, "manager": _safe_str(manager), "players": roster_ids}
@@ -230,7 +289,6 @@ async def refresh_snapshot(force: bool = False) -> None:
         if INJURY_LIMIT_TO_TOP_N:
             refresh_top_players()
 
-        
     except Exception as e:
         logger.exception("Failed to refresh league snapshot: %s", e)
 
@@ -435,12 +493,6 @@ def _state_add(kind: str, key: str, cap: int = 400) -> None:
         _save_state(STATE)
 
 # ---------- Alerts fetch + post ----------
-SCORE_POST_LIMIT       = int(os.getenv("SCORE_POST_LIMIT", "12"))
-INJURY_POST_LIMIT      = int(os.getenv("INJURY_POST_LIMIT", "24"))
-INJURY_PRIORITY_LIMIT  = int(os.getenv("INJURY_PRIORITY_LIMIT", "16"))
-INJURY_MAX_DAYS        = int(os.getenv("INJURY_MAX_DAYS", "3"))
-INJURY_MAX_DAYS_Q      = int(os.getenv("INJURY_MAX_DAYS_Q", "7"))
-
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 
 DEFAULT_HEADERS = {
@@ -1109,22 +1161,39 @@ async def ask(interaction: discord.Interaction, question: str):
 async def roster(interaction: discord.Interaction, team: str):
     await interaction.response.defer(thinking=True)
     await refresh_snapshot()
+
+    # find matching team
     match_team_id = None
-    tlower = team.lower()
+    tlower = (team or "").lower()
     for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
-        if tlower in t.get("name", "").lower() or tlower in t.get("manager", "").lower():
+        if tlower in (t.get("name", "")).lower() or tlower in (t.get("manager", "")).lower():
             match_team_id = tid
             break
     if not match_team_id:
         await interaction.followup.send(f"Couldn't find a team matching **{team}**.")
         return
+
     t = LEAGUE_SNAPSHOT["teams"][match_team_id]
+    cur_wk = LEAGUE_SNAPSHOT.get("meta", {}).get("current_week")
+
     lines = [f"**{t['name']}** (Mgr: {t['manager']})"]
     for pid in t.get("players", []):
         p = LEAGUE_SNAPSHOT["players"].get(pid)
         if not p:
             continue
-        lines.append(f"- {p['name']} ({p['position']}, {p['team']}) proj: {p['projections']:.2f}")
+
+        name = p.get("name", "?")
+        pos  = p.get("position", "?")
+        team_abbr = p.get("team", "")
+        proj = float(p.get("proj_week", p.get("projections", 0.0)) or 0.0)  # prefer weekly proj
+        pts  = p.get("pts_week", None)
+
+        # build the line
+        if pts is not None and cur_wk is not None:
+            lines.append(f"- {name} ({pos}, {team_abbr}) proj: {proj:.2f} | wk{cur_wk}: {float(pts):.2f}")
+        else:
+            lines.append(f"- {name} ({pos}, {team_abbr}) proj: {proj:.2f}")
+
     await send_long_followup(interaction, "\n".join(lines))
 
 @bot.tree.command(name="whohas", description="Find which team has a player.")

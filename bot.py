@@ -65,6 +65,23 @@ except Exception as e:
     _BS4 = False
     logger.warning("beautifulsoup4 unavailable: %s (pip install beautifulsoup4)", e)
 
+# Prefer lxml if available (more robust parser)
+_PARSER = "lxml"
+try:
+    import lxml  # noqa: F401
+except Exception:
+    _PARSER = "html.parser"
+
+# Common request headers so ESPN returns the full HTML
+REQUEST_HEADERS = {
+    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                               "Chrome/127.0.0.0 Safari/537.36"),
+    "Accept-Language": os.getenv("HTTP_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
+}
+
 # -------- ESPN config --------
 def _getenv_str(name: str) -> Optional[str]:
     v = os.getenv(name)
@@ -454,7 +471,7 @@ async def _fetch_json(url: str) -> Optional[dict]:
     if not _HTTPX:
         return None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, headers=REQUEST_HEADERS) as client:
             r = await client.get(url)
             r.raise_for_status()
             return r.json()
@@ -464,7 +481,7 @@ async def _fetch_json(url: str) -> Optional[dict]:
 
 async def _fetch_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
     try:
-        r = await client.get(url, timeout=15)
+        r = await client.get(url, timeout=15, headers=REQUEST_HEADERS)
         r.raise_for_status()
         return r.text
     except Exception as e:
@@ -510,15 +527,14 @@ def _parse_date_guess(s: str) -> Optional[dt.datetime]:
     s = (s or "").strip()
     if not s:
         return None
-    # Try a few ESPN-like patterns
     fmts = [
         "%a, %b %d, %Y", "%b %d, %Y", "%a %b %d, %Y",
-        "%a, %b %d", "%b %d"  # no year
+        "%a, %b %d", "%b %d"
     ]
     for f in fmts:
         with contextlib.suppress(Exception):
             d = dt.datetime.strptime(s, f)
-            if d.year == 1900:  # no year in string
+            if d.year == 1900:
                 d = d.replace(year=dt.datetime.now(dt.timezone.utc).year)
             return d.replace(tzinfo=dt.timezone.utc)
     return None
@@ -538,7 +554,6 @@ def _sanitize_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def _extract_player_id_from_href(href: str) -> Optional[str]:
-    # typical: /nfl/player/_/id/1877225/christian-mccaffrey
     m = re.search(r"/id/(\d+)", href or "")
     return m.group(1) if m else None
 
@@ -547,6 +562,11 @@ def _pos_clean(s: str) -> str:
 
 def _allowed_pos(s: str) -> bool:
     return _pos_clean(s) in ALLOWED_POS
+
+def _guess_pos_from_name_cell(text: str) -> str:
+    # Some ESPN tables embed "QB" etc near the name — try to pull a 2–3 letter uppercase token.
+    m = re.search(r"\b(QB|RB|WR|TE|K)\b", text or "", re.I)
+    return (m.group(1).upper() if m else "")
 
 async def _scrape_team_injuries(client: httpx.AsyncClient, code: str, pretty_name: str, abbrev: str) -> List[dict]:
     """
@@ -562,17 +582,22 @@ async def _scrape_team_injuries(client: httpx.AsyncClient, code: str, pretty_nam
     if not html:
         return []
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, _PARSER)
+    # ESPN uses "Table" class; fallback to any table if not found
     tables = soup.select("table.Table")
+    if not tables:
+        tables = soup.find_all("table")
+
     out: List[dict] = []
 
     for table in tables:
-        # Header
         thead = table.find("thead")
         if not thead:
             continue
         headers = [th.get_text(strip=True).lower() for th in thead.find_all("th")]
-        # Try to map common columns
+        if not headers:
+            continue
+
         def idx(name_opts: List[str]) -> Optional[int]:
             for i, h in enumerate(headers):
                 for n in name_opts:
@@ -581,11 +606,11 @@ async def _scrape_team_injuries(client: httpx.AsyncClient, code: str, pretty_nam
             return None
 
         idx_player = idx(["player"])
-        idx_pos = idx(["pos"])
+        idx_pos = idx(["pos", "position"])
         idx_injury = idx(["injury"])
         idx_status = idx(["status", "game status"])
-        idx_desc = idx(["description", "notes"])
-        idx_date = idx(["date", "updated"])
+        idx_desc = idx(["description", "notes", "detail"])
+        idx_date = idx(["date", "updated", "last", "report"])
 
         tbody = table.find("tbody")
         if not tbody:
@@ -593,7 +618,7 @@ async def _scrape_team_injuries(client: httpx.AsyncClient, code: str, pretty_nam
 
         for tr in tbody.find_all("tr"):
             tds = tr.find_all(["td"])
-            if not tds or (idx_player is None or idx_pos is None):
+            if not tds or (idx_player is None):
                 continue
 
             # Player + id
@@ -603,11 +628,15 @@ async def _scrape_team_injuries(client: httpx.AsyncClient, code: str, pretty_nam
             a = player_td.find("a")
             name = _sanitize_space(a.get_text()) if a else _sanitize_space(player_td.get_text())
             href = a.get("href") if a else ""
-            aid = _extract_player_id_from_href(href) or name.lower().replace(" ", "-")  # fallback
+            aid = _extract_player_id_from_href(href) or name.lower().replace(" ", "-")
 
-            pos = _pos_clean(tds[idx_pos].get_text() if idx_pos < len(tds) else "")
+            pos = _pos_clean(tds[idx_pos].get_text() if (idx_pos is not None and idx_pos < len(tds)) else "")
+            if not pos:
+                pos = _guess_pos_from_name_cell(player_td.get_text())
+
+            # Only fantasy positions
             if not _allowed_pos(pos):
-                continue  # skip defense/OL etc.
+                continue
 
             injury_type = _sanitize_space(tds[idx_injury].get_text()) if (idx_injury is not None and idx_injury < len(tds)) else ""
             status_text = _sanitize_space(tds[idx_status].get_text()) if (idx_status is not None and idx_status < len(tds)) else ""
@@ -616,7 +645,6 @@ async def _scrape_team_injuries(client: httpx.AsyncClient, code: str, pretty_nam
             when = _parse_date_guess(date_text)
 
             designation = _extract_designation_from_text(status_text, injury_type, desc) or (status_text or "Injury")
-            # Keep type separate so we can format "Questionable (Calf)"
             out.append({
                 "team": pretty_name,
                 "abbrev": abbrev,
@@ -633,7 +661,7 @@ async def _scrape_team_injuries(client: httpx.AsyncClient, code: str, pretty_nam
 async def _scrape_all_injuries() -> List[dict]:
     if not _HTTPX or not _BS4:
         return []
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=20, headers=REQUEST_HEADERS) as client:
         tasks = []
         for abbr, (code, pretty) in TEAM_MAP.items():
             tasks.append(_scrape_team_injuries(client, code, pretty, abbr))
@@ -703,13 +731,12 @@ async def _post_startup_scores(ch: discord.TextChannel):
             continue
         lines.append((key, line))
 
-    # Post (dedupe by key, plus "already sent" safety)
     posted = 0
     for key, line in lines[:SCORE_POST_LIMIT]:
         if _state_has("scores", key):
             continue
         if await _already_sent(ch, line):
-            _state_add("scores", key)  # sync state with recent chat
+            _state_add("scores", key)
             continue
         await ch.send(line)
         _state_add("scores", key)
@@ -726,8 +753,6 @@ async def _post_injuries(ch: discord.TextChannel):
         return
 
     now_utc = dt.datetime.now(dt.timezone.utc)
-
-    # Build buckets with recency gates
     priority: List[Tuple[str, str, dt.datetime]] = []
     regular: List[Tuple[str, str, dt.datetime]] = []
 
@@ -748,7 +773,6 @@ async def _post_injuries(ch: discord.TextChannel):
         bucket = priority if _is_priority_designation(designation) else regular
         bucket.append((key, line, when or dt.datetime.min.replace(tzinfo=dt.timezone.utc)))
 
-    # Newest first
     priority.sort(key=lambda x: x[2], reverse=True)
     regular.sort(key=lambda x: x[2], reverse=True)
 

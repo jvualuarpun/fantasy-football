@@ -229,6 +229,58 @@ def _safe_str(x) -> str:
     except Exception:
         return "?"
 
+def _collect_weekly_points(lg, week: int) -> Dict[str, Dict[str, float]]:
+    """
+    Build { player_key: {"pts_week": x, "proj_week": y} } from box scores for a week.
+    Keys include:
+      - the numeric/string playerId when available
+      - a fallback 'name:<lowercased name>' key (for slots where espn_api lacks an id)
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    try:
+        boxes = lg.box_scores(week=week)
+    except Exception as e:
+        logger.warning("box_scores(%s) failed: %s", week, e)
+        return out
+
+    def _ingest_lineup(lineup):
+        for bp in lineup or []:
+            # try to pull id & name from BoxPlayer
+            raw_id = (
+                getattr(bp, "playerId", None)
+                or getattr(getattr(bp, "player", None), "playerId", None)
+                or getattr(getattr(bp, "player", None), "id", None)
+            )
+            name = (
+                getattr(bp, "name", None)
+                or getattr(bp, "playerName", None)
+                or getattr(getattr(bp, "player", None), "name", None)
+            )
+
+            pts = 0.0
+            proj = 0.0
+            with contextlib.suppress(Exception):
+                pts = float(getattr(bp, "points", 0.0) or 0.0)
+            with contextlib.suppress(Exception):
+                proj = float(getattr(bp, "projected_points", 0.0) or 0.0)
+
+            # store under id if present
+            if raw_id is not None:
+                out[_safe_str(raw_id)] = {"pts_week": pts, "proj_week": proj}
+            # also store a by-name key (helps when id is missing/mismatched)
+            if name:
+                out[f"name:{name.lower().strip()}"] = {"pts_week": pts, "proj_week": proj}
+
+    try:
+        for bs in boxes or []:
+            _ingest_lineup(getattr(bs, "home_lineup", []))
+            _ingest_lineup(getattr(bs, "away_lineup", []))
+    except Exception as e:
+        logger.warning("Failed parsing box_scores lineups: %s", e)
+
+    logger.info("Collected weekly box points for %d player keys (week %s)", len(out), week)
+    return out
+
 async def refresh_snapshot(force: bool = False) -> None:
     ok, why = _league_ready()
     if not ok:
@@ -240,33 +292,54 @@ async def refresh_snapshot(force: bool = False) -> None:
         current_week = _detect_current_week_from_league(lg)
         LEAGUE_SNAPSHOT["meta"]["current_week"] = current_week
 
+        logger.info("refresh_snapshot: current_week=%s", current_week)
+
+        # Pull weekly points/projections from box scores FIRST
+        week_pts_map = _collect_weekly_points(lg, current_week)
+
+        logger.info("week_pts_map keys=%d (sample: %s)",
+            len(week_pts_map),
+            list(list(week_pts_map.keys())[:6]))
+
         teams_map: Dict[str, dict] = {}
         players_map: Dict[str, dict] = {}
+
         for t in lg.teams:
             team_id = getattr(t, "team_id", None) or getattr(t, "teamId", None) or _safe_str(t)
             team_name = getattr(t, "team_name", "Team")
             manager = getattr(getattr(t, "owner", None), "nickname", None) or getattr(t, "owner", None) or "Manager"
             roster_ids: List[str] = []
+
             for p in getattr(t, "roster", []):
                 pid = _safe_str(getattr(p, "playerId", None) or getattr(p, "id", None) or getattr(p, "name", ""))
                 team_abbrev = getattr(p, "proTeam", "") or getattr(p, "proTeamAbbreviation", "") or ""
                 pos = getattr(p, "position", "") or (getattr(p, "eligibleSlots", [""])[0] if getattr(p, "eligibleSlots", None) else "")
 
-                # --- new: capture projections & actual points for current week
-                proj_week = _extract_week_points(p, current_week, source_id=1)  # projected this week
-                pts_week  = _extract_week_points(p, current_week, source_id=0)  # actual this week
+                name_key = f"name:{(getattr(p, 'name', '') or '').lower().strip()}"
+                wpts = week_pts_map.get(pid) or week_pts_map.get(name_key) or {}
+
+                # >>> ADDED: log when no weekly points/projections were found for this player
+                if not wpts:
+                    logger.debug("No week pts for %s (pid=%s, name_key=%s)",
+                                 getattr(p, "name", "?"), pid, name_key)
+
+                proj_week = float(wpts.get("proj_week", 0.0) or 0.0)
+                pts_week  = float(wpts.get("pts_week", 0.0) or 0.0)
 
                 players_map[pid] = {
                     "name": getattr(p, "name", f"Player {pid}"),
                     "team": team_abbrev,
                     "position": pos,
-                    "projections": proj_week,   # keep legacy key for old code paths
+                    # keep legacy key so existing code keeps working
+                    "projections": proj_week,
                     "proj_week": proj_week,
                     "pts_week": pts_week,
                 }
                 roster_ids.append(pid)
-            teams_map[str(team_id)] = {"name": team_name, "manager": _safe_str(manager), "players": roster_ids}
 
+            teams_map[_safe_str(team_id)] = {"name": team_name, "manager": _safe_str(manager), "players": roster_ids}
+
+        # Draft (unchanged)
         draft_list = []
         with contextlib.suppress(Exception):
             if getattr(lg, "draft", None):
@@ -285,7 +358,9 @@ async def refresh_snapshot(force: bool = False) -> None:
         LEAGUE_SNAPSHOT["players"] = players_map
         LEAGUE_SNAPSHOT["draft"] = draft_list
         LEAGUE_SNAPSHOT["meta"]["last_refresh"] = now
-        logger.info("League snapshot refreshed at %s", now)
+
+        logger.info("League snapshot refreshed (week %s) at %s", current_week, now)
+
         if INJURY_LIMIT_TO_TOP_N:
             refresh_top_players()
 
@@ -1307,6 +1382,123 @@ async def status(interaction: discord.Interaction):
         f"Alerts: channel={'set' if ALERT_CHANNEL_ID else 'unset'} scores={'on' if POST_SCORES else 'off'} injuries={'on' if POST_INJURIES else 'off'}",
     ]
     await interaction.followup.send("\n".join(lines))
+
+@bot.tree.command(
+    name="injuries",
+    description="List ESPN team injury updates for a date range (e.g., 'Sep 1-5', 'Sep 3', or '2025-09-01..2025-09-05')."
+)
+@app_commands.describe(
+    date_range="Examples: 'Sep 1-5', 'Sep 3', '2025-09-01..2025-09-05'"
+)
+async def injuries(interaction: discord.Interaction, date_range: str):
+    await interaction.response.defer(thinking=True)
+
+    # --- tiny helper: parse user date/range into (start_date, end_date) ---
+    def _parse_user_date_range(s: str) -> Optional[tuple[dt.date, dt.date]]:
+        if not s:
+            return None
+        s = s.strip()
+        # Normalize separators
+        s = s.replace("—", "-").replace(" to ", "-").replace("..", "-").replace("—", "-")
+        # Current year assumption unless ISO given
+        today = dt.datetime.now(dt.timezone.utc).date()
+        year = today.year
+
+        # ISO style "YYYY-MM-DD-YYYY-MM-DD"
+        m = re.match(r"^\s*(\d{4})-(\d{2})-(\d{2})\s*[-–]\s*(\d{4})-(\d{2})-(\d{2})\s*$", s)
+        if m:
+            y1, M1, d1, y2, M2, d2 = map(int, m.groups())
+            a = dt.date(y1, M1, d1)
+            b = dt.date(y2, M2, d2)
+            return (a, b) if a <= b else (b, a)
+
+        # ISO single day "YYYY-MM-DD"
+        m = re.match(r"^\s*(\d{4})-(\d{2})-(\d{2})\s*$", s)
+        if m:
+            y, M, d = map(int, m.groups())
+            a = dt.date(y, M, d)
+            return (a, a)
+
+        # "Sep 1-5" or "September 1-5"
+        m = re.match(r"^\s*([A-Za-z]{3,9})\s+(\d{1,2})\s*[-–]\s*(\d{1,2})\s*$", s)
+        if m:
+            mon_txt, d1, d2 = m.group(1), int(m.group(2)), int(m.group(3))
+            try:
+                M = _MONTHS[mon_txt[:3].title()]
+                a = dt.date(year, M, min(d1, d2))
+                b = dt.date(year, M, max(d1, d2))
+                return (a, b)
+            except Exception:
+                return None
+
+        # "Sep 3" or "September 3"
+        m = re.match(r"^\s*([A-Za-z]{3,9})\s+(\d{1,2})\s*$", s)
+        if m:
+            mon_txt, d = m.group(1), int(m.group(2))
+            try:
+                M = _MONTHS[mon_txt[:3].title()]
+                a = dt.date(year, M, d)
+                return (a, a)
+            except Exception:
+                return None
+
+        return None
+
+    rng = _parse_user_date_range(date_range)
+    if not rng:
+        await interaction.followup.send(
+            "I couldn’t read that date range. Try examples like **Sep 1-5**, **Sep 3**, or **2025-09-01..2025-09-05**."
+        )
+        return
+
+    start_date, end_date = rng
+    # Sanity (inclusive window)
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    # Pull fresh HTML per-team and parse
+    items = await _scrape_all_injuries_html()
+    if not items:
+        await interaction.followup.send("No injuries found from ESPN right now.")
+        return
+
+    # Filter to items that have an actual date AND fall within the window (inclusive)
+    def _within(item) -> bool:
+        d = item.get("when_date")
+        return isinstance(d, dt.date) and (start_date <= d <= end_date)
+
+    filtered = [it for it in items if _within(it)]
+
+    if not filtered:
+        await interaction.followup.send(
+            f"No dated injury updates found between **{start_date.strftime('%b %-d')}** and **{end_date.strftime('%b %-d')}**."
+        )
+        return
+
+    # Sort: date asc, team abbrev, player name
+    filtered.sort(key=lambda it: (
+        it.get("when_date") or dt.date(1970,1,1),
+        (it.get("abbrev") or ""),
+        (it.get("name") or "")
+    ))
+
+    # Format lines
+    lines = [f"**Injury updates {start_date.strftime('%b %-d')} — {end_date.strftime('%b %-d')}**"]
+    for it in filtered:
+        d = it.get("when_date")
+        dtag = d.strftime("%b %-d") if isinstance(d, dt.date) else ""
+        team = it.get("team") or it.get("abbrev") or "Team"
+        name = it.get("name", "?")
+        pos  = it.get("pos", "")
+        des  = it.get("designation", "")
+        typ  = (f" ({it.get('type')})" if it.get("type") else "")
+        detail = (it.get("detail") or "").strip()
+        if len(detail) > 140:
+            detail = detail[:137] + "…"
+        lines.append(f"[{dtag}] {team}: **{name}** ({pos}) — {des}{typ}. {detail}")
+
+    await send_long_followup(interaction, "\n".join(lines), attach_name="injuries.txt")
+
 
 # -------- Background: live refresh --------
 @tasks.loop(minutes=10)

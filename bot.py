@@ -42,9 +42,11 @@ POST_SCORES = os.getenv("POST_SCORES", "true").lower() == "true"
 POST_INJURIES = os.getenv("POST_INJURIES", "true").lower() == "true"
 STATE_PATH = os.getenv("STATE_PATH", "state.json")
 
-# New: tune injury posting behavior (env-configurable)
+# Tunables (ENV) for injury posting behavior
 INJURY_POST_LIMIT = int(os.getenv("INJURY_POST_LIMIT", "25"))  # how many injuries to post at startup
-INJURY_MAX_DAYS = int(os.getenv("INJURY_MAX_DAYS", "5"))       # only post injuries within N days
+INJURY_MAX_DAYS = int(os.getenv("INJURY_MAX_DAYS", "5"))       # only post injuries within N days (general)
+# Wider freshness window for key designations so we don’t miss “Questionable/Doubtful/Out”
+INJURY_MAX_DAYS_Q = int(os.getenv("INJURY_MAX_DAYS_Q", "10"))
 
 # httpx for ESPN site APIs
 try:
@@ -432,14 +434,51 @@ def _score_key(event: dict) -> Optional[str]:
     return None
 
 def _injury_key(team: dict, item: dict) -> Optional[str]:
-    # Unique-ish key combining athlete id + date or detail
+    # Unique-ish key combining athlete id + date + status/type
     ath = (item.get("athlete") or {})
     aid = str(ath.get("id") or "")
     date = (item.get("date") or "")[:19]
-    typ = (item.get("type") or {}).get("text") or item.get("status") or ""
+    status_text = (item.get("status") or "").strip()
+    typ = (item.get("type") or {})
+    type_text = (typ.get("text") or typ.get("name") or "").strip()
+    tag = status_text or type_text
     if aid:
-        return f"inj:{aid}:{date}:{typ}"
+        return f"inj:{aid}:{date}:{tag}"
     return None
+
+# ---- helpers for better designation detection ----
+def _extract_designation_parts(item: dict) -> Tuple[str, str, str, bool]:
+    """
+    Returns (designation, type_text, status_text, is_qd) where:
+      - designation is the best human label to show (Questionable/Doubtful/Out/Probable/Inactive/... or fallback)
+      - type_text is e.g. 'Calf'
+      - status_text is raw status if present
+      - is_qd is True if designation is one of the key tags (questionable/doubtful/out/probable/inactive)
+    """
+    typ = (item.get("type") or {})
+    type_text = (typ.get("text") or typ.get("name") or typ.get("shortName") or "").strip()
+    status_text = (item.get("status") or item.get("designation") or "").strip()
+    name_text = (item.get("name") or item.get("shortName") or "").strip()
+    detail = (item.get("detail") or "").strip()
+
+    # look across fields + detail for a status keyword
+    blob = " ".join([status_text, type_text, name_text, detail]).lower()
+    status_map = {
+        "questionable": "Questionable",
+        "doubtful": "Doubtful",
+        "out": "Out",
+        "probable": "Probable",
+        "inactive": "Inactive",
+    }
+    chosen = None
+    for k, pretty in status_map.items():
+        if k in blob:
+            chosen = pretty
+            break
+
+    designation = chosen or status_text or type_text or "Injury"
+    is_qd = (designation.lower() in status_map)
+    return designation, type_text, status_text, is_qd
 
 def _format_score_line(event: dict) -> Optional[str]:
     try:
@@ -465,7 +504,7 @@ def _format_score_line(event: dict) -> Optional[str]:
         elif state == "in":
             return f"⏱️ Live (Q{period} {clock}): {an} {as_} — {hn} {hs}"
         else:
-            # pre-game, only post once when it goes live/final; we skip at startup
+            # pre-game: skip
             return None
     except Exception:
         return None
@@ -476,16 +515,10 @@ def _format_injury_line(team: dict, item: dict) -> Optional[str]:
         ath = (item.get("athlete") or {})
         aname = ath.get("displayName") or ath.get("shortName") or "Player"
         pos = (ath.get("position") or {}).get("abbreviation") or ""
-        typ = (item.get("type") or {})
-        type_text = typ.get("text") or typ.get("name") or ""       # e.g., "Calf"
-        status_text = item.get("status") or ""                     # e.g., "Questionable", "Out"
-        detail = item.get("detail") or ""                          # free text detail if present
 
-        # Prefer explicit game designation; fallback to type
-        designation = status_text or type_text or "Injury"
-
-        # If we have both, show designation and (type) once (avoid duplication)
-        extra = f" ({type_text})" if type_text and (status_text.lower() if status_text else "") not in type_text.lower() else ""
+        designation, type_text, status_text, _is_qd = _extract_designation_parts(item)
+        extra = f" ({type_text})" if type_text and (designation.lower() not in type_text.lower()) else ""
+        detail = (item.get("detail") or "").strip()
         detail_part = f" {detail}" if detail else ""
 
         # Hidden marker for dedupe (injuries only)
@@ -536,16 +569,20 @@ async def _post_startup_injuries(ch: discord.TextChannel):
             if not key or _state_has("injuries", key):
                 continue
 
-            # recency gate
+            # Recency gate with special window for key designations
             when_raw = it.get("date")
             dt_when = None
             with contextlib.suppress(Exception):
                 if when_raw:
                     dt_when = dt.datetime.fromisoformat(when_raw.replace("Z", "+00:00"))
 
+            # peek designation to choose window
+            designation, _type_text, _status_text, is_qd = _extract_designation_parts(it)
+            days_limit = INJURY_MAX_DAYS_Q if is_qd else INJURY_MAX_DAYS
+
             recent_ok = True
             if dt_when:
-                if (now_utc - dt_when).days > INJURY_MAX_DAYS:
+                if (now_utc - dt_when).days > days_limit:
                     recent_ok = False
 
             if not recent_ok:
@@ -580,7 +617,7 @@ async def startup_alerts():
                 if m.author.id != (bot.user.id if bot.user else 0):
                     continue
                 if m.content:
-                    # Score rehydrate used to look for "#score", but we've removed score tags from output by request.
+                    # Score rehydrate disabled (we removed visible #score tag)
                     if "#inj " in m.content:
                         idx = m.content.find("#inj ")
                         if idx != -1:

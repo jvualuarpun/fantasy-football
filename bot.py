@@ -1216,6 +1216,17 @@ async def sync_cleanup(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(embed=err_embed(f"Sync failed: {e}"))
 
+@bot.tree.command(name="sync_here", description="Force-sync slash commands to THIS server only (fast).")
+@app_commands.default_permissions(manage_guild=True)
+async def sync_here(interaction: discord.Interaction):
+    # Force a guild-only sync so changes appear instantly in this server
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        await bot.tree.sync(guild=interaction.guild)
+        await interaction.followup.send("✅ Synced commands to this server.")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Sync failed here: {e}")
+
 @bot.tree.command(name="ask", description="Ask anything — generic assistant reply with light league context.")
 @app_commands.describe(question="Your question")
 async def ask(interaction: discord.Interaction, question: str):

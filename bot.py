@@ -371,12 +371,18 @@ def _load_state() -> Dict[str, List[str]]:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"scores": [], "injuries": []}
+            data = {"scores": [], "injuries": [], "meta": {}}
         data.setdefault("scores", [])
         data.setdefault("injuries", [])
+        # new: keep a meta bucket for timestamps, etc.
+        meta = data.setdefault("meta", {})
+        # ensure inj_last_run exists (ISO string or None)
+        if "inj_last_run" not in meta:
+            meta["inj_last_run"] = None
         return data
     except Exception:
-        return {"scores": [], "injuries": []}
+        return {"scores": [], "injuries": [], "meta": {"inj_last_run": None}}
+
 
 def _save_state(state: Dict[str, List[str]]) -> None:
     with contextlib.suppress(Exception):
@@ -439,6 +445,41 @@ TEAM_NAME = {
 ALLOWED_POS = {"QB","RB","WR","TE","K"}
 PRIORITY_KEYS = {"questionable","doubtful","out","inactive","probable"}
 
+# --- NEW: injury recency control ---
+# Only publish injuries that are newer than the last successful run (with a small buffer).
+# If no last-run timestamp is stored yet, only go back this many days on first boot:
+INJURY_HTML_MAX_DAYS_BOOTSTRAP = int(os.getenv("INJURY_HTML_MAX_DAYS_BOOTSTRAP", "4"))
+# Always allow priority flags (Q/D/OUT/Inactive/Probable) back this many days even if older (keeps big updates):
+INJURY_PRIORITY_LOOKBACK_DAYS = int(os.getenv("INJURY_PRIORITY_LOOKBACK_DAYS", "7"))
+# Grace buffer before last run to catch items that published right before downtime (minutes):
+INJURY_GRACE_MINUTES = int(os.getenv("INJURY_GRACE_MINUTES", "90"))
+
+# Date header patterns like "Sep 4"
+_MONTHS = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,"Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
+_DATE_RE = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})$")
+
+def _coerce_date_from_header(txt: str) -> Optional[dt.date]:
+    """Convert 'Sep 4' into a date in the current year (handles year roll-over in Jan)."""
+    m = _DATE_RE.match((txt or "").strip())
+    if not m:
+        return None
+    mon_abbr, day_s = m.group(1), m.group(2)
+    month = _MONTHS.get(mon_abbr, 0)
+    if not month:
+        return None
+    today = dt.datetime.now(dt.timezone.utc).date()
+    year = today.year
+    # Handle possible year rollover if we're in Jan and page shows Dec
+    if today.month == 1 and month == 12:
+        year -= 1
+    try:
+        return dt.date(year, month, int(day_s))
+    except Exception:
+        return None
+
+def _iso_date(d: Optional[dt.date]) -> Optional[str]:
+    return d.isoformat() if isinstance(d, dt.date) else None
+
 def _pos_ok(p: str) -> bool:
     return (p or "").upper() in ALLOWED_POS
 
@@ -446,11 +487,13 @@ def _designation_from_text(*parts: str) -> Optional[str]:
     blob = " ".join([p or "" for p in parts]).lower()
     for k in PRIORITY_KEYS:
         if k in blob:
+            # Normalize capitalization (Questionable, Doubtful, Out, Inactive, Probable)
             return k.capitalize()
-    # Fall back to any visible status label
+    # Sometimes "Injured reserve", "IR", etc. appear; keep as-is if useful
+    # Fall back to first non-empty piece capitalized
     for p in parts:
-        if p:
-            return p.strip()
+        if p and p.strip():
+            return p.strip().split()[0].capitalize()
     return None
 
 def _extract_text(el) -> str:
@@ -472,60 +515,146 @@ def _find_nearest_date(node) -> Optional[str]:
 
 def _parse_team_injuries_html(html: str, abbr: str) -> List[dict]:
     """
-    Parse ESPN team injuries HTML (div-based) and return normalized items:
-      { team, abbrev, athlete_id, name, pos, designation, type, detail, when(Optional[str]) }
+    Parse ESPN team injuries page (new div-based layout) with fallback to old table layout.
+    Returns items:
+      { team, abbrev, athlete_id, name, pos, designation, type, detail, when_date (date or None) }
     """
     if not _BS4 or not html:
         return []
     soup = BeautifulSoup(html, "html.parser")
     items: List[dict] = []
 
-    # New structure: one or more "Athlete__PlayerWrapper" blocks per injured player
-    wrappers = soup.find_all("div", class_=re.compile(r"Athlete__PlayerWrapper"))
-    if not wrappers:
-        # Some pages render name/status outside that wrapper; fallback: hunt h3 name rows with adjacent status/detail
-        wrappers = soup.select("h3:has(span.Athlete__PlayerName)")
-    found = 0
+    # --- Primary path: div-based layout with date headers and player blocks ---
+    # Date headers look like: <div class="pb3 bb bb--dotted brdr-clr-gray-07 n8 fw-medium mb2">Sep 4</div>
+    date_headers = []
+    for div in soup.find_all("div"):
+        txt = _extract_text(div)
+        if _DATE_RE.match(txt or "") and "bb--dotted" in " ".join(div.get("class", [])):
+            date_headers.append(div)
 
-    for w in wrappers:
-        # If w is a <h3>, set a local 'root' for sibling searches
-        root = w if hasattr(w, "name") and w.name == "h3" else w
+    if date_headers:
+        for header in date_headers:
+            date_obj = _coerce_date_from_header(_extract_text(header))
+            # Walk following siblings/elements until next date header
+            for sib in header.find_all_next():
+                if sib is header:
+                    continue
+                if sib.name == "div":
+                    txt = _extract_text(sib)
+                    # If we hit another date header, stop this block
+                    if _DATE_RE.match(txt or "") and "bb--dotted" in " ".join(sib.get("class", [])):
+                        break
+                    # Player wrapper pattern you posted:
+                    # <div class="Athlete__PlayerWrapper ...">
+                    classes = set(sib.get("class", []))
+                    if any(cls.startswith("Athlete__PlayerWrapper") for cls in classes):
+                        # name + position live in an <h3> with spans
+                        h3 = sib.find("h3")
+                        if not h3:
+                            continue
+                        name_span = h3.find("span", class_=lambda c: c and "Athlete__PlayerName" in c)
+                        pos_span  = h3.find("span", class_=lambda c: c and "Athlete__NameDetails" in c)
+                        player_name = _extract_text(name_span) if name_span else ""
+                        pos_text    = _extract_text(pos_span) if pos_span else ""
+                        pos = (pos_text.split() or [""])[0].upper().strip(" ,;/")
+                        if not player_name or not _pos_ok(pos):
+                            continue
 
-        name_el = root.find("span", class_=re.compile(r"Athlete__PlayerName"))
-        pos_el  = root.find("span", class_=re.compile(r"Athlete__NameDetails"))
-        status_el = root.find("span", class_=re.compile(r"TextStatus"))
-        detail_el = root.find("div", class_=re.compile(r"\bpt3\b"))  # detail paragraph often has pt3 + gray
+                        # status line: <div class="flex n9"><span>Status</span><span class="TextStatus ...">Questionable</span></div>
+                        status_div = sib.find("div", class_=lambda c: c and "flex" in c.split())
+                        status_txt = ""
+                        if status_div and "Status" in _extract_text(status_div):
+                            status_val = status_div.find("span", class_=lambda c: c and "TextStatus" in c)
+                            status_txt = _extract_text(status_val)
 
-        name = _extract_text(name_el) if name_el else ""
-        pos_full = _extract_text(pos_el) if pos_el else ""
-        # Position is usually just the token like "RB" inside the details span; grab last token
-        pos = (pos_full.split()[-1] if pos_full else "").upper()
-        if not name or not _pos_ok(pos):
+                        designation = _designation_from_text(status_txt)
+
+                        # detail: <div class="pt3 ...">Player (x) was ...</div>
+                        detail_div = sib.find("div", class_=lambda c: c and "pt3" in c.split())
+                        detail_txt = _extract_text(detail_div)
+
+                        # injury type: try to sniff from detail "(knee)" etc.
+                        inj_type = ""
+                        m = re.search(r"\(([A-Za-z \-/]+)\)", detail_txt or "")
+                        if m:
+                            inj_type = m.group(1).strip()
+
+                        items.append({
+                            "team": TEAM_NAME.get(abbr, abbr),
+                            "abbrev": abbr,
+                            "athlete_id": player_name.lower().replace(" ", "-"),
+                            "name": player_name,
+                            "pos": pos,
+                            "designation": designation or "Injury",
+                            "type": inj_type,
+                            "detail": detail_txt,
+                            "when_date": date_obj,  # a datetime.date
+                        })
+        if items:
+            # De-dupe within this page by (name, pos, designation, date)
+            seen = set()
+            deduped = []
+            for it in items:
+                k = (it["name"].lower(), it["pos"], it["designation"].lower(), _iso_date(it["when_date"]))
+                if k in seen:
+                    continue
+                seen.add(k)
+                deduped.append(it)
+            return deduped
+
+    # --- Fallback: old table layout (no per-row dates) ---
+    tables = soup.select("table.Table")
+    for tbl in tables:
+        header_cells = tbl.select("thead tr th")
+        if not header_cells:
+            continue
+        headers = [(_extract_text(th) or "").strip().lower() for th in header_cells]
+        def _find(names):
+            for nm in names:
+                if nm in headers:
+                    return headers.index(nm)
+            return None
+        i_player = _find({"player","player name"})
+        i_pos = _find({"pos","position"})
+        i_injury = _find({"injury","injuries","report","note","notes"})
+        i_status = _find({"status","game status"})
+        if i_player is None or i_pos is None:
             continue
 
-        status_txt = _extract_text(status_el)
-        designation = _designation_from_text(status_txt) or "Injury"
+        for tr in tbl.select("tbody tr"):
+            tds = tr.find_all("td")
+            if not tds or len(tds) < max(i_player, i_pos) + 1:
+                continue
+            player_name = _extract_text(tds[i_player])
+            pos = _extract_text(tds[i_pos]).upper()
+            if not player_name or not _pos_ok(pos):
+                continue
+            inj_type = _extract_text(tds[i_injury]) if (i_injury is not None and i_injury < len(tds)) else ""
+            status = _extract_text(tds[i_status]) if (i_status is not None and i_status < len(tds)) else ""
+            designation = _designation_from_text(status, inj_type) or (status or "Injury")
 
-        detail = _extract_text(detail_el)
-        when = _find_nearest_date(root)
+            items.append({
+                "team": TEAM_NAME.get(abbr, abbr),
+                "abbrev": abbr,
+                "athlete_id": player_name.lower().replace(" ", "-"),
+                "name": player_name,
+                "pos": pos,
+                "designation": designation,
+                "type": inj_type or "",
+                "detail": "",
+                "when_date": None,  # table doesn’t show dates per row
+            })
+    # dedupe fallback
+    seen = set()
+    deduped = []
+    for it in items:
+        k = (it["name"].lower(), it["pos"], it["designation"].lower(), _iso_date(it["when_date"]))
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(it)
+    return deduped
 
-        athlete_slug = name.lower().replace(" ", "-")
-
-        items.append({
-            "team": TEAM_NAME.get(abbr, abbr),
-            "abbrev": abbr,
-            "athlete_id": athlete_slug,
-            "name": name,
-            "pos": pos,
-            "designation": designation,
-            "type": "",         # ESPN HTML doesn't always have a separate "type" column in this layout
-            "detail": detail,
-            "when": when,
-        })
-        found += 1
-
-    logger.info("Parsed %s injuries for %s from HTML", found, abbr)
-    return items
 
 async def _fetch_text(url: str) -> Optional[str]:
     if not _HTTPX:
@@ -554,14 +683,24 @@ async def _scrape_all_injuries_html() -> List[dict]:
             merged.extend(res)
     return merged
 
-def _fmt_injury_line(team_name: str, player_name: str, pos: str, designation: str, inj_type: str, detail: str, athlete_id: str, when: Optional[str]) -> str:
-    date_part = f"[{when}] " if when else ""
-    extra = f" ({inj_type})" if inj_type and designation.lower() not in inj_type.lower() else ""
+def _fmt_injury_line(team_name: str, player_name: str, pos: str, designation: str, inj_type: str, detail: str, date_iso: Optional[str]) -> str:
+    # Human-friendly date tag if we know it (e.g., "Sep 4")
+    date_tag = ""
+    if date_iso:
+        try:
+            d = dt.date.fromisoformat(date_iso)
+            date_tag = f"[{d.strftime('%b %-d')}] " if hasattr(d, "strftime") else f"[{date_iso}] "
+        except Exception:
+            date_tag = f"[{date_iso}] "
+    extra = f" ({inj_type})" if inj_type and designation.lower() not in (inj_type or "").lower() else ""
     detail_part = f" {detail}" if detail else ""
-    return f"{date_part}🩺 {team_name}: {player_name} ({pos}) — {designation}{extra}.{detail_part}"
+    return f"{date_tag}🩺 {team_name}: {player_name} ({pos}) — {designation}{extra}.{detail_part}"
 
-def _inj_key(team_abbr: str, athlete_slug: str, designation: str) -> str:
-    return f"inj:{team_abbr}:{athlete_slug}:{(designation or '').lower()}"
+
+def _inj_key(team_abbr: str, athlete_slug: str, designation: str, date_iso: Optional[str]) -> str:
+    # Include date in the key when available so historical items don’t collide with fresh ones
+    return f"inj:{team_abbr}:{athlete_slug}:{(designation or '').lower()}:{date_iso or 'nodate'}"
+
 
 async def _already_sent(ch: discord.TextChannel, content: str) -> bool:
     """Prevents duplicate posts by comparing exact content in recent bot messages."""
@@ -650,52 +789,94 @@ def _is_priority(designation: str) -> bool:
 async def _post_injuries(ch: discord.TextChannel):
     if not POST_INJURIES:
         return
+
+    # Compute time window
+    now = dt.datetime.now(dt.timezone.utc)
+    last_run_s = STATE.get("meta", {}).get("inj_last_run")
+    if last_run_s:
+        try:
+            last_run = dt.datetime.fromisoformat(last_run_s.replace("Z", "+00:00"))
+        except Exception:
+            last_run = None
+    else:
+        last_run = None
+
+    # Start publishing window:
+    if last_run is not None:
+        since_dt = last_run - dt.timedelta(minutes=INJURY_GRACE_MINUTES)
+    else:
+        since_dt = now - dt.timedelta(days=INJURY_HTML_MAX_DAYS_BOOTSTRAP)
+
     items = await _scrape_all_injuries_html()
     if not items:
         logger.info("No injuries found from ESPN HTML pages.")
         return
 
-    # Sort/partition: priority first
-    priority: List[Tuple[str, str]] = []
-    regular: List[Tuple[str, str]] = []
-    total_seen = 0
+    # Normalize + Filter by date
+    ready: List[Tuple[str, str, bool]] = []  # (state_key, line, is_priority)
+    per_run_seen = set()  # stop duplicates within the same scrape
 
     for it in items:
-        total_seen += 1
-        key = _inj_key(it["abbrev"], it["athlete_id"], it["designation"] or "")
-        line = _fmt_injury_line(it["team"], it["name"], it["pos"], it["designation"], it.get("type",""), it.get("detail",""), it["athlete_id"], it.get("when"))
-        if _is_priority(it["designation"]):
-            priority.append((key, line))
+        d_iso = _iso_date(it.get("when_date"))
+        # Convert date to datetime at UTC midnight for comparison
+        if d_iso:
+            try:
+                when_dt = dt.datetime.fromisoformat(d_iso)  # naive date -> datetime; treat as midnight
+                when_dt = when_dt.replace(tzinfo=dt.timezone.utc)
+            except Exception:
+                when_dt = None
         else:
-            regular.append((key, line))
+            when_dt = None
+
+        is_prio = _is_priority(it["designation"])
+
+        # Filter rule:
+        # - If we have a date: include if when_dt >= since_dt, OR (is_prio and within priority lookback)
+        # - If no date: include only if priority (we can't safely time-bound otherwise)
+        include = False
+        if when_dt is not None:
+            if when_dt >= since_dt:
+                include = True
+            elif is_prio and when_dt >= now - dt.timedelta(days=INJURY_PRIORITY_LOOKBACK_DAYS):
+                include = True
+        else:
+            include = is_prio  # undated table rows: only priority to avoid old spam
+
+        if not include:
+            continue
+
+        key = _inj_key(it["abbrev"], it["athlete_id"], it["designation"], d_iso)
+        line = _fmt_injury_line(it["team"], it["name"], it["pos"], it["designation"], it["type"], it["detail"], d_iso)
+
+        # Per-run content de-dupe and state de-dupe:
+        if (key in per_run_seen) or _state_has("injuries", key) or await _already_sent(ch, line):
+            continue
+        per_run_seen.add(key)
+
+        ready.append((key, line, is_prio))
+
+    # Sort: priority first, then by line (stable)
+    ready.sort(key=lambda t: (not t[2], t[1]))
 
     posted = 0
-    # Priority posts (Q/D/O/Inactive/Probable)
-    for key, line in priority[:INJURY_PRIORITY_LIMIT]:
+    for key, line, _prio in ready:
+        # safety cap (use your existing env-driven caps)
         if posted >= INJURY_POST_LIMIT:
             break
-        if _state_has("injuries", key):
-            continue
-        if await _already_sent(ch, line):
-            _state_add("injuries", key)
-            continue
         await ch.send(line)
         _state_add("injuries", key)
         posted += 1
 
-    # Remaining posts from regular list
-    remaining = max(0, INJURY_POST_LIMIT - posted)
-    for key, line in regular[:remaining]:
-        if _state_has("injuries", key):
-            continue
-        if await _already_sent(ch, line):
-            _state_add("injuries", key)
-            continue
-        await ch.send(line)
-        _state_add("injuries", key)
-        posted += 1
+    # Update last run timestamp on success (even if 0 posted, we still update to avoid re-scanning far past)
+    STATE.setdefault("meta", {})["inj_last_run"] = now.isoformat()
+    _save_state(STATE)
 
-    logger.info("Injuries: parsed=%s, priority_posted=%s, total_posted=%s", total_seen, min(len(priority), INJURY_PRIORITY_LIMIT), posted)
+    logger.info("Injuries posted: %s (window since %s, priority lookback %sd, grace %smin)",
+                posted,
+                since_dt.isoformat(),
+                INJURY_PRIORITY_LOOKBACK_DAYS,
+                INJURY_GRACE_MINUTES)
+
 
 async def _get_alert_channel() -> Optional[discord.TextChannel]:
     if not ALERT_CHANNEL_ID:

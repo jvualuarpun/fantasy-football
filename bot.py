@@ -428,7 +428,6 @@ def league_context_for_ai(max_teams: int = 8) -> str:
         for name, v in totals[:max_teams]:
             top_lines.append(f"- {name}: {v:.1f}")
     else:
-        # Still give the assistant a sense of the league membership without numbers
         for tid, t in list(LEAGUE_SNAPSHOT.get("teams", {}).items())[:max_teams]:
             top_lines.append(f"- {t.get('name', f'Team {tid}')}")
 
@@ -472,14 +471,12 @@ async def send_long_followup(interaction: discord.Interaction, content: str, att
 @bot.tree.command(name="sync_cleanup", description="Clear stale guild commands after switching back to global-only.")
 @app_commands.default_permissions(manage_guild=True)
 async def sync_cleanup(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         await bot.tree.sync(guild=None)  # globals authoritative
-        await interaction.response.send_message(
-            embed=ok_embed("Sync Cleanup", "Global commands re-synced. Stale guild commands should clear shortly."),
-            ephemeral=True
-        )
+        await interaction.followup.send(embed=ok_embed("Sync Cleanup", "Global commands re-synced. Stale guild commands should clear shortly."))
     except Exception as e:
-        await interaction.response.send_message(embed=err_embed(f"Sync failed: {e}"), ephemeral=True)
+        await interaction.followup.send(embed=err_embed(f"Sync failed: {e}"))
 
 @bot.tree.command(name="ask", description="Ask anything — generic assistant reply with light league context.")
 @app_commands.describe(question="Your question")
@@ -487,11 +484,9 @@ async def ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
     await refresh_snapshot()
 
-    # If an OpenAI Assistant is configured, route the question straight through (no canned logic).
     if bot.assistant.enabled:
         try:
             context = league_context_for_ai(max_teams=8)
-            # Provide minimal grounding to the assistant, then the user’s question.
             await bot.assistant.add_to_thread(context, role="system")
             await bot.assistant.add_to_thread(question, role="user")
             reply = await bot.assistant.get_reply()
@@ -504,7 +499,6 @@ async def ask(interaction: discord.Interaction, question: str):
             await interaction.followup.send("Assistant error. Please try again in a moment.")
             return
 
-    # Fallback if no assistant is configured
     missing = []
     if not OPENAI_API_KEY: missing.append("OPENAI_API_KEY")
     if not OPENAI_ASSISTANT_ID: missing.append("OPENAI_ASSISTANT_ID")
@@ -514,7 +508,6 @@ async def ask(interaction: discord.Interaction, question: str):
         "Set these env vars and redeploy: " + (", ".join(missing) if missing else "(missing configuration)")
     )
     await interaction.followup.send(msg)
-
 
 @bot.tree.command(name="roster", description="Show a team's roster.")
 @app_commands.describe(team="Team name or manager (partial ok)")
@@ -654,22 +647,25 @@ async def projections(interaction: discord.Interaction):
 # /recap and alias /weekly_report (placeholder stubs; can wire box score parsing later)
 @bot.tree.command(name="recap", description="Alias of /weekly_report.")
 async def recap(interaction: discord.Interaction):
-    await interaction.response.send_message("Weekly recap will be implemented with box score parsing.")
+    await interaction.response.defer(thinking=True)
+    await interaction.followup.send("Weekly recap will be implemented with box score parsing.")
 
 @bot.tree.command(name="weekly_report", description="Weekly report.")
 async def weekly_report(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
     await recap.callback(interaction)
 
 # Optional: quick status command for debugging
 @bot.tree.command(name="status", description="Show ESPN connection status & snapshot info.")
 async def status(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=True)
     ready, why = _league_ready()
     lines = [
         f"League ID: {LEAGUE_ID or 'missing'} | Year: {YEAR}",
         f"Snapshot last refresh: {LEAGUE_SNAPSHOT['meta'].get('last_refresh', 'never')}",
         f"Ready: {'yes' if ready else 'no'}{f' — {why}' if not ready else ''}",
     ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await interaction.followup.send("\n".join(lines))
 
 # -------- Background: live refresh --------
 @tasks.loop(minutes=10)

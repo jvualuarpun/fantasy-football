@@ -43,10 +43,10 @@ POST_INJURIES = os.getenv("POST_INJURIES", "true").lower() == "true"
 STATE_PATH = os.getenv("STATE_PATH", "state.json")
 
 # Tunables (ENV) for injury posting behavior
-INJURY_POST_LIMIT = int(os.getenv("INJURY_POST_LIMIT", "25"))  # how many injuries to post at startup
-INJURY_MAX_DAYS = int(os.getenv("INJURY_MAX_DAYS", "5"))       # only post injuries within N days (general)
-# Wider freshness window for key designations so we don’t miss “Questionable/Doubtful/Out”
-INJURY_MAX_DAYS_Q = int(os.getenv("INJURY_MAX_DAYS_Q", "10"))
+INJURY_POST_LIMIT = int(os.getenv("INJURY_POST_LIMIT", "25"))       # total items to post per cycle
+INJURY_PRIORITY_LIMIT = int(os.getenv("INJURY_PRIORITY_LIMIT", "40"))# max priority items (posted first)
+INJURY_MAX_DAYS = int(os.getenv("INJURY_MAX_DAYS", "5"))            # general injuries recency
+INJURY_MAX_DAYS_Q = int(os.getenv("INJURY_MAX_DAYS_Q", "21"))       # priority designations recency
 
 # httpx for ESPN site APIs
 try:
@@ -461,7 +461,6 @@ def _extract_designation_parts(item: dict) -> Tuple[str, str, str, bool]:
     name_text = (item.get("name") or item.get("shortName") or "").strip()
     detail = (item.get("detail") or "").strip()
 
-    # look across fields + detail for a status keyword
     blob = " ".join([status_text, type_text, name_text, detail]).lower()
     status_map = {
         "questionable": "Questionable",
@@ -490,7 +489,6 @@ def _format_score_line(event: dict) -> Optional[str]:
         period = status.get("period", 0)
 
         competitors = comp.get("competitors") or []
-        # home/away order
         home = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
         away = next((c for c in competitors if c.get("homeAway") == "away"), competitors[-1])
 
@@ -504,7 +502,6 @@ def _format_score_line(event: dict) -> Optional[str]:
         elif state == "in":
             return f"⏱️ Live (Q{period} {clock}): {an} {as_} — {hn} {hs}"
         else:
-            # pre-game: skip
             return None
     except Exception:
         return None
@@ -516,7 +513,7 @@ def _format_injury_line(team: dict, item: dict) -> Optional[str]:
         aname = ath.get("displayName") or ath.get("shortName") or "Player"
         pos = (ath.get("position") or {}).get("abbreviation") or ""
 
-        designation, type_text, status_text, _is_qd = _extract_designation_parts(item)
+        designation, type_text, _status_text, _is_qd = _extract_designation_parts(item)
         extra = f" ({type_text})" if type_text and (designation.lower() not in type_text.lower()) else ""
         detail = (item.get("detail") or "").strip()
         detail_part = f" {detail}" if detail else ""
@@ -525,8 +522,6 @@ def _format_injury_line(team: dict, item: dict) -> Optional[str]:
         aid = ath.get("id") or "0"
         when = (item.get("date") or "")[:19]
 
-        # Example:
-        # 🩺 49ers: Christian McCaffrey (RB) — Questionable (Calf). Limited Thursday.
         return f"🩺 {tname}: {aname} ({pos}) — {designation}{extra}.{detail_part} [#inj {aid}:{when}]"
     except Exception:
         return None
@@ -548,7 +543,6 @@ async def _post_startup_scores(ch: discord.TextChannel):
             continue
         lines.append((key, line))
 
-    # Post only a few to avoid burst spam
     for key, line in lines[:12]:
         await ch.send(line)
         _state_add("scores", key)
@@ -560,8 +554,10 @@ async def _post_startup_injuries(ch: discord.TextChannel):
     if not data:
         return
     teams = data.get("teams") or []
-    collected: List[Tuple[str, str, dt.datetime]] = []
     now_utc = dt.datetime.now(dt.timezone.utc)
+
+    priority: List[Tuple[str, str, dt.datetime]] = []
+    regular: List[Tuple[str, str, dt.datetime]] = []
 
     for team in teams:
         for it in team.get("injuries", []) or []:
@@ -569,22 +565,21 @@ async def _post_startup_injuries(ch: discord.TextChannel):
             if not key or _state_has("injuries", key):
                 continue
 
-            # Recency gate with special window for key designations
+            # Parse date
             when_raw = it.get("date")
             dt_when = None
             with contextlib.suppress(Exception):
                 if when_raw:
                     dt_when = dt.datetime.fromisoformat(when_raw.replace("Z", "+00:00"))
 
-            # peek designation to choose window
             designation, _type_text, _status_text, is_qd = _extract_designation_parts(it)
             days_limit = INJURY_MAX_DAYS_Q if is_qd else INJURY_MAX_DAYS
 
+            # Recency check
             recent_ok = True
             if dt_when:
                 if (now_utc - dt_when).days > days_limit:
                     recent_ok = False
-
             if not recent_ok:
                 continue
 
@@ -592,15 +587,28 @@ async def _post_startup_injuries(ch: discord.TextChannel):
             if not line:
                 continue
 
-            collected.append((key, line, dt_when or dt.datetime.min.replace(tzinfo=dt.timezone.utc)))
+            bucket = priority if is_qd else regular
+            bucket.append((key, line, dt_when or dt.datetime.min.replace(tzinfo=dt.timezone.utc)))
 
-    # newest first so stars don’t get buried
-    collected.sort(key=lambda x: x[2], reverse=True)
+    # Sort by newest first
+    priority.sort(key=lambda x: x[2], reverse=True)
+    regular.sort(key=lambda x: x[2], reverse=True)
 
-    # Limit initial flood (env configurable)
-    for key, line, _ in collected[:INJURY_POST_LIMIT]:
+    posted = 0
+    # Post priority items first
+    for key, line, _ in priority[:INJURY_PRIORITY_LIMIT]:
+        if posted >= INJURY_POST_LIMIT:
+            break
         await ch.send(line)
         _state_add("injuries", key)
+        posted += 1
+
+    # Then post regular items up to remaining budget
+    remaining = max(0, INJURY_POST_LIMIT - posted)
+    for key, line, _ in regular[:remaining]:
+        await ch.send(line)
+        _state_add("injuries", key)
+        posted += 1
 
 async def startup_alerts():
     ch = await _get_alert_channel()
@@ -617,7 +625,7 @@ async def startup_alerts():
                 if m.author.id != (bot.user.id if bot.user else 0):
                     continue
                 if m.content:
-                    # Score rehydrate disabled (we removed visible #score tag)
+                    # score rehydrate disabled (no #score tag anymore)
                     if "#inj " in m.content:
                         idx = m.content.find("#inj ")
                         if idx != -1:

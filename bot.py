@@ -314,8 +314,9 @@ class DiscordOpenAIInterface:
         while not self.message_queue.empty():
             message_text, role = await self.message_queue.get()
             try:
+                # Threads API expects roles 'user' or 'assistant'; keep it 'user' for our context.
                 await self.client.beta.threads.messages.create(
-                    thread_id=self.thread_id, role=role, content=message_text
+                    thread_id=self.thread_id, role="user", content=message_text
                 )
             except Exception as e:
                 logger.error("OpenAI queue error: %s", e)
@@ -413,7 +414,7 @@ def league_context_for_ai(max_teams: int = 8) -> str:
     Small, neutral context for the assistant: lineup rules + a short view of the league.
     Keeps it generic; no canned answers.
     """
-    lineup = ", ".join(f"{k}:{v}" for k, v in LEAGUE_SNAPSHOT.get("lineup", {}).items())
+    lineup = ", ".join(f"{k}:{v}" for k, v in LEAGUE_SNAPSHOT.get('lineup', {}).items())
     last = LEAGUE_SNAPSHOT["meta"].get("last_refresh", "never")
 
     # Build a lightweight top list (if projections exist)
@@ -473,10 +474,13 @@ async def send_long_followup(interaction: discord.Interaction, content: str, att
 async def sync_cleanup(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
-        await bot.tree.sync(guild=None)  # globals authoritative
-        await interaction.followup.send(embed=ok_embed("Sync Cleanup", "Global commands re-synced. Stale guild commands should clear shortly."))
+        cmds = await bot.tree.sync(guild=None)  # globals authoritative
+        await interaction.followup.send(
+            embed=ok_embed("Sync Cleanup", f"Global commands re-synced ({len(cmds)}). Stale guild commands should clear shortly."),
+            ephemeral=True
+        )
     except Exception as e:
-        await interaction.followup.send(embed=err_embed(f"Sync failed: {e}"))
+        await interaction.followup.send(embed=err_embed(f"Sync failed: {e}"), ephemeral=True)
 
 @bot.tree.command(name="ask", description="Ask anything — generic assistant reply with light league context.")
 @app_commands.describe(question="Your question")
@@ -487,7 +491,8 @@ async def ask(interaction: discord.Interaction, question: str):
     if bot.assistant.enabled:
         try:
             context = league_context_for_ai(max_teams=8)
-            await bot.assistant.add_to_thread(context, role="system")
+            # Threads API doesn't support 'system' role; push context as a user message.
+            await bot.assistant.add_to_thread(context, role="user")
             await bot.assistant.add_to_thread(question, role="user")
             reply = await bot.assistant.get_reply()
             if not isinstance(reply, str) or not reply.strip():
@@ -633,15 +638,45 @@ async def projections(interaction: discord.Interaction):
                 "Keep it light and avoid inventing specific past matchups. Focus on positional strengths.\n\n"
                 "Top teams and totals:\n" + "\n".join(f"{n}: {v:.1f}" for n, v in totals[:5])
             )
-            await bot.assistant.add_to_thread(context, role="system")
+            # Push as user messages for Threads API compatibility
+            await bot.assistant.add_to_thread(context, role="user")
             await bot.assistant.add_to_thread("Give me a fun but grounded summary.", role="user")
             blurb = await bot.assistant.get_reply()
             lines.append("")
-            lines.append(blurb.strip())
+            lines.append((blurb or "").strip())
         except Exception as e:
             logger.info("Assistant commentary failed: %s", e)
 
     lines.append(f"\nSnapshot: {LEAGUE_SNAPSHOT['meta'].get('last_refresh','never')}")
+    await send_long_followup(interaction, "\n".join(lines))
+
+# ✅ Proper alias for /grades with defer
+@bot.tree.command(name="draft_grades", description="Alias of /grades.")
+async def draft_grades(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    await grades.callback(interaction)
+
+@bot.tree.command(name="grades", description="Roster grades with slot breakdown.")
+async def grades(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    await refresh_snapshot()
+    results = []
+    for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
+        breakdown = compute_team_breakdown(t)
+        total = sum(breakdown.values())
+        results.append((t["name"], breakdown, total))
+    if not results:
+        await interaction.followup.send("No league data available.")
+        return
+    totals = [r[2] for r in results]
+    mean = sum(totals) / len(totals)
+    sd = (sum((x - mean) ** 2 for x in totals) / max(1, len(totals) - 1)) ** 0.5
+    lines = ["**Roster Grades**"]
+    for name, breakdown, total in sorted(results, key=lambda x: x[2], reverse=True):
+        z = (total - mean) / sd if sd else 0
+        grade = grade_from_zscore(z)
+        parts = ", ".join([f"{k}:{v:.1f}" for k, v in breakdown.items()])
+        lines.append(f"- **{name}** → {grade} (proj {total:.1f}, z={z:+.2f}) [{parts}]")
     await send_long_followup(interaction, "\n".join(lines))
 
 # /recap and alias /weekly_report (placeholder stubs; can wire box score parsing later)
@@ -665,7 +700,7 @@ async def status(interaction: discord.Interaction):
         f"Snapshot last refresh: {LEAGUE_SNAPSHOT['meta'].get('last_refresh', 'never')}",
         f"Ready: {'yes' if ready else 'no'}{f' — {why}' if not ready else ''}",
     ]
-    await interaction.followup.send("\n".join(lines))
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 # -------- Background: live refresh --------
 @tasks.loop(minutes=10)

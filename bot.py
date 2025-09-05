@@ -26,7 +26,7 @@ load_dotenv()  # read .env for DISCORD_TOKEN, ESPN creds, OpenAI, toggles
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("fantasy-bot")
 
-# Quieten httpx request logs (they were spamming your Render logs)
+# Quieten noisy httpx request logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # -------- Discord / Bot config --------
@@ -397,16 +397,14 @@ def _state_add(kind: str, key: str, cap: int = 400) -> None:
         _save_state(STATE)
 
 # ---------- Alerts fetch + post ----------
-# Limits (tweak via env if you like)
 SCORE_POST_LIMIT       = int(os.getenv("SCORE_POST_LIMIT", "12"))
 INJURY_POST_LIMIT      = int(os.getenv("INJURY_POST_LIMIT", "24"))
-INJURY_PRIORITY_LIMIT  = int(os.getenv("INJURY_PRIORITY_LIMIT", "16"))  # questionable/doubtful/out/inactive cap
-INJURY_MAX_DAYS        = int(os.getenv("INJURY_MAX_DAYS", "3"))         # non-priority window (when timestamps present)
-INJURY_MAX_DAYS_Q      = int(os.getenv("INJURY_MAX_DAYS_Q", "7"))       # priority window (when timestamps present)
+INJURY_PRIORITY_LIMIT  = int(os.getenv("INJURY_PRIORITY_LIMIT", "16"))
+INJURY_MAX_DAYS        = int(os.getenv("INJURY_MAX_DAYS", "3"))
+INJURY_MAX_DAYS_Q      = int(os.getenv("INJURY_MAX_DAYS_Q", "7"))
 
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 
-# HTTP defaults for HTML
 DEFAULT_HEADERS = {
     "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                                "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -441,6 +439,94 @@ TEAM_NAME = {
 ALLOWED_POS = {"QB","RB","WR","TE","K"}
 PRIORITY_KEYS = {"questionable","doubtful","out","inactive","probable"}
 
+def _pos_ok(p: str) -> bool:
+    return (p or "").upper() in ALLOWED_POS
+
+def _designation_from_text(*parts: str) -> Optional[str]:
+    blob = " ".join([p or "" for p in parts]).lower()
+    for k in PRIORITY_KEYS:
+        if k in blob:
+            return k.capitalize()
+    # Fall back to any visible status label
+    for p in parts:
+        if p:
+            return p.strip()
+    return None
+
+def _extract_text(el) -> str:
+    try:
+        return " ".join(el.get_text(" ", strip=True).split())
+    except Exception:
+        return ""
+
+def _find_nearest_date(node) -> Optional[str]:
+    # date examples like "Sep 4" in a dotted border div
+    try:
+        prev = node.find_previous("div", class_=re.compile(r"bb--dotted"))
+        text = _extract_text(prev) if prev else ""
+        if re.search(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", text):
+            return text
+    except Exception:
+        pass
+    return None
+
+def _parse_team_injuries_html(html: str, abbr: str) -> List[dict]:
+    """
+    Parse ESPN team injuries HTML (div-based) and return normalized items:
+      { team, abbrev, athlete_id, name, pos, designation, type, detail, when(Optional[str]) }
+    """
+    if not _BS4 or not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    items: List[dict] = []
+
+    # New structure: one or more "Athlete__PlayerWrapper" blocks per injured player
+    wrappers = soup.find_all("div", class_=re.compile(r"Athlete__PlayerWrapper"))
+    if not wrappers:
+        # Some pages render name/status outside that wrapper; fallback: hunt h3 name rows with adjacent status/detail
+        wrappers = soup.select("h3:has(span.Athlete__PlayerName)")
+    found = 0
+
+    for w in wrappers:
+        # If w is a <h3>, set a local 'root' for sibling searches
+        root = w if hasattr(w, "name") and w.name == "h3" else w
+
+        name_el = root.find("span", class_=re.compile(r"Athlete__PlayerName"))
+        pos_el  = root.find("span", class_=re.compile(r"Athlete__NameDetails"))
+        status_el = root.find("span", class_=re.compile(r"TextStatus"))
+        detail_el = root.find("div", class_=re.compile(r"\bpt3\b"))  # detail paragraph often has pt3 + gray
+
+        name = _extract_text(name_el) if name_el else ""
+        pos_full = _extract_text(pos_el) if pos_el else ""
+        # Position is usually just the token like "RB" inside the details span; grab last token
+        pos = (pos_full.split()[-1] if pos_full else "").upper()
+        if not name or not _pos_ok(pos):
+            continue
+
+        status_txt = _extract_text(status_el)
+        designation = _designation_from_text(status_txt) or "Injury"
+
+        detail = _extract_text(detail_el)
+        when = _find_nearest_date(root)
+
+        athlete_slug = name.lower().replace(" ", "-")
+
+        items.append({
+            "team": TEAM_NAME.get(abbr, abbr),
+            "abbrev": abbr,
+            "athlete_id": athlete_slug,
+            "name": name,
+            "pos": pos,
+            "designation": designation,
+            "type": "",         # ESPN HTML doesn't always have a separate "type" column in this layout
+            "detail": detail,
+            "when": when,
+        })
+        found += 1
+
+    logger.info("Parsed %s injuries for %s from HTML", found, abbr)
+    return items
+
 async def _fetch_text(url: str) -> Optional[str]:
     if not _HTTPX:
         return None
@@ -453,83 +539,6 @@ async def _fetch_text(url: str) -> Optional[str]:
     except Exception as e:
         logger.info("Fetch text failed %s: %s", url, e)
         return None
-
-def _pos_ok(p: str) -> bool:
-    return (p or "").upper() in ALLOWED_POS
-
-def _designation_from_text(*parts: str) -> Optional[str]:
-    blob = " ".join([p or "" for p in parts]).lower()
-    for k in PRIORITY_KEYS:
-        if k in blob:
-            return k.capitalize()
-    return None
-
-def _inj_key(team_abbr: str, athlete_slug: str, designation: str) -> str:
-    return f"inj:{team_abbr}:{athlete_slug}:{designation.lower()}"
-
-def _extract_text(el) -> str:
-    try:
-        return " ".join(el.get_text(" ", strip=True).split())
-    except Exception:
-        return ""
-
-def _parse_team_injuries_html(html: str, abbr: str) -> List[dict]:
-    """
-    Parse a single ESPN team injuries HTML page and return normalized items:
-      { team, abbrev, athlete_id, name, pos, designation, type, detail, when(None) }
-    """
-    if not _BS4 or not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    tables = soup.select("table.Table")
-    items: List[dict] = []
-
-    for tbl in tables:
-        header_cells = tbl.select("thead tr th")
-        if not header_cells:
-            continue
-        headers = [(_extract_text(th) or "").strip().lower() for th in header_cells]
-        # Need PLAYER/PLAYER NAME and POS
-        def _find(names):
-            for nm in names:
-                if nm in headers:
-                    return headers.index(nm)
-            return None
-
-        i_player = _find({"player","player name"})
-        i_pos = _find({"pos","position"})
-        i_injury = _find({"injury","injuries","report","note","notes"})
-        i_status = _find({"status","game status"})
-
-        if i_player is None or i_pos is None:
-            continue
-
-        for tr in tbl.select("tbody tr"):
-            tds = tr.find_all("td")
-            if not tds or len(tds) < max(i_player, i_pos) + 1:
-                continue
-            player_name = _extract_text(tds[i_player])
-            if not player_name:
-                continue
-            pos = _extract_text(tds[i_pos]).upper()
-            if not _pos_ok(pos):
-                continue
-            inj_type = _extract_text(tds[i_injury]) if (i_injury is not None and i_injury < len(tds)) else ""
-            status = _extract_text(tds[i_status]) if (i_status is not None and i_status < len(tds)) else ""
-            designation = _designation_from_text(status, inj_type) or (status or "Injury")
-
-            items.append({
-                "team": TEAM_NAME.get(abbr, abbr),
-                "abbrev": abbr,
-                "athlete_id": player_name.lower().replace(" ", "-"),
-                "name": player_name,
-                "pos": pos,
-                "designation": designation,
-                "type": inj_type or "",
-                "detail": "",
-                "when": None,  # ESPN HTML page does not carry per-row timestamps
-            })
-    return items
 
 async def _scrape_team_injuries(abbr: str) -> List[dict]:
     url = f"https://www.espn.com/nfl/team/injuries/_/name/{abbr.lower()}"
@@ -545,10 +554,14 @@ async def _scrape_all_injuries_html() -> List[dict]:
             merged.extend(res)
     return merged
 
-def _fmt_injury_line(team_name: str, player_name: str, pos: str, designation: str, inj_type: str, detail: str, athlete_id: str) -> str:
+def _fmt_injury_line(team_name: str, player_name: str, pos: str, designation: str, inj_type: str, detail: str, athlete_id: str, when: Optional[str]) -> str:
+    date_part = f"[{when}] " if when else ""
     extra = f" ({inj_type})" if inj_type and designation.lower() not in inj_type.lower() else ""
     detail_part = f" {detail}" if detail else ""
-    return f"🩺 {team_name}: {player_name} ({pos}) — {designation}{extra}.{detail_part}"
+    return f"{date_part}🩺 {team_name}: {player_name} ({pos}) — {designation}{extra}.{detail_part}"
+
+def _inj_key(team_abbr: str, athlete_slug: str, designation: str) -> str:
+    return f"inj:{team_abbr}:{athlete_slug}:{(designation or '').lower()}"
 
 async def _already_sent(ch: discord.TextChannel, content: str) -> bool:
     """Prevents duplicate posts by comparing exact content in recent bot messages."""
@@ -642,12 +655,15 @@ async def _post_injuries(ch: discord.TextChannel):
         logger.info("No injuries found from ESPN HTML pages.")
         return
 
-    # Sort: priority first
+    # Sort/partition: priority first
     priority: List[Tuple[str, str]] = []
     regular: List[Tuple[str, str]] = []
+    total_seen = 0
+
     for it in items:
-        key = _inj_key(it["abbrev"], it["athlete_id"], it["designation"])
-        line = _fmt_injury_line(it["team"], it["name"], it["pos"], it["designation"], it["type"], it["detail"], it["athlete_id"])
+        total_seen += 1
+        key = _inj_key(it["abbrev"], it["athlete_id"], it["designation"] or "")
+        line = _fmt_injury_line(it["team"], it["name"], it["pos"], it["designation"], it.get("type",""), it.get("detail",""), it["athlete_id"], it.get("when"))
         if _is_priority(it["designation"]):
             priority.append((key, line))
         else:
@@ -679,7 +695,7 @@ async def _post_injuries(ch: discord.TextChannel):
         _state_add("injuries", key)
         posted += 1
 
-    logger.info("Injuries: posted %s (priority up to %s, total cap %s)", posted, INJURY_PRIORITY_LIMIT, INJURY_POST_LIMIT)
+    logger.info("Injuries: parsed=%s, priority_posted=%s, total_posted=%s", total_seen, min(len(priority), INJURY_PRIORITY_LIMIT), posted)
 
 async def _get_alert_channel() -> Optional[discord.TextChannel]:
     if not ALERT_CHANNEL_ID:
@@ -707,7 +723,7 @@ async def startup_alerts():
                 if m.author.id != (bot.user.id if bot.user else 0):
                     continue
                 if m.content:
-                    # We dedupe by content equality now; but hydrate a few keys if legacy tags exist.
+                    # legacy inj tags hydration (safe to keep)
                     if "#inj " in m.content:
                         idx = m.content.find("#inj ")
                         if idx != -1:
@@ -791,6 +807,7 @@ def league_context_for_ai(max_teams: int = 8) -> str:
     else:
         for tid, t in list(LEAGUE_SNAPSHOT.get("teams", {}).items())[:max_teams]:
             top_lines.append(f"- {t.get('name', f'Team {tid}')}")
+
     context = (
         "You are a helpful fantasy football assistant inside a Discord server.\n"
         "You have access to a brief league snapshot to ground your answers.\n\n"

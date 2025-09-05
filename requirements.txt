@@ -3,3 +3,5 @@ python-dotenv
 espn-api
 openai
 httpx
+beautifulsoup4
+lxml

@@ -72,144 +72,6 @@ INJURY_TOP_N = int(os.getenv("INJURY_TOP_N", "200"))
 
 TOP_PLAYER_NAMES: set[str] = set()
 
-# ---- Live scoring watcher (60s) with quips and quarter recaps ----
-LIVE_POLL_SECONDS = int(os.getenv("SCORE_POLL_SECONDS", "60"))
-
-def _event_snapshot(ev: dict) -> Optional[dict]:
-    try:
-        comp = (ev.get("competitions") or [])[0]
-        status = comp.get("status", {})
-        stype  = status.get("type") or {}
-        state  = stype.get("state")  # pre | in | post
-        period = int(status.get("period") or 0)
-        clock  = status.get("displayClock") or ""
-        comps  = comp.get("competitors") or []
-        home = next((c for c in comps if c.get("homeAway") == "home"), comps[0])
-        away = next((c for c in comps if c.get("homeAway") == "away"), comps[-1])
-        hn = (home.get("team") or {}).get("abbreviation") or (home.get("team") or {}).get("shortDisplayName")
-        an = (away.get("team") or {}).get("abbreviation") or (away.get("team") or {}).get("shortDisplayName")
-        hs = int(home.get("score") or 0)
-        as_ = int(away.get("score") or 0)
-        return {
-            "state": state, "period": period, "clock": clock,
-            "home_abbr": _norm_abbr(hn), "away_abbr": _norm_abbr(an),
-            "home_score": hs, "away_score": as_,
-        }
-    except Exception:
-        return None
-
-def _score_change(prev: dict, cur: dict) -> Optional[str]:
-    if not prev:
-        return None
-    if cur["state"] != "in":
-        return None
-    pdelta = (cur["home_score"] - prev.get("home_score", 0), cur["away_score"] - prev.get("away_score", 0))
-    # prefer to call out the team that just increased their score
-    if pdelta[0] > 0 or pdelta[1] > 0:
-        who = cur["home_abbr"] if pdelta[0] > pdelta[1] else cur["away_abbr"]
-        return who
-    return None
-
-def _quarter_change(prev: dict, cur: dict) -> Optional[Tuple[int, int]]:
-    if not prev:
-        return None
-    if cur["state"] != "in":
-        return None
-    if cur["period"] > prev.get("period", 0):
-        return (prev.get("period", 0), cur["period"])
-    return None
-
-@tasks.loop(seconds=LIVE_POLL_SECONDS)
-async def scores_watch():
-    if not POST_SCORES or not _HTTPX:
-        return
-    ch = await _get_alert_channel()
-    if not ch:
-        return
-
-    # fetch once
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(SCOREBOARD_URL, headers=DEFAULT_HEADERS)
-            r.raise_for_status()
-            data = r.json()
-    except Exception as e:
-        logger.info("scores_watch fetch failed: %s", e)
-        return
-
-    idx = _fantasy_index_by_abbr()
-    events = data.get("events") or []
-    changed_any = False
-
-    for ev in events:
-        eid = ev.get("id")
-        if not eid:
-            continue
-        cur = _event_snapshot(ev)
-        if not cur:
-            continue
-
-        last = STATE.get("score_state", {}).get(eid, {})
-        STATE.setdefault("score_state", {})
-
-        # 1) Quarter change recap
-        qc = _quarter_change(last, cur)
-        if qc:
-            q_from, q_to = qc
-            line = f"🧭 End Q{q_from} → Start Q{q_to}: {cur['away_abbr']} {cur['away_score']} — {cur['home_abbr']} {cur['home_score']}"
-            if not await _already_sent(ch, line):
-                await ch.send(line)
-                changed_any = True
-
-        # 2) Score change with quip
-        who = _score_change(last, cur)
-        if who:
-            # base line
-            base = f"⏱️ Live (Q{cur['period']} {cur['clock']}): {cur['away_abbr']} {cur['away_score']} — {cur['home_abbr']} {cur['home_score']}"
-            quip = _fun_quip(who, idx)
-            line = base + (quip or "")
-            key = f"score:{eid}:Q{cur['period']}:{cur['away_score']}-{cur['home_score']}"
-            if not _state_has("scores", key) and not await _already_sent(ch, line):
-                await ch.send(line)
-                _state_add("scores", key)
-                changed_any = True
-
-        # 3) Final with per-game fantasy impact (top 5)
-        if cur["state"] == "post" and last.get("state") != "post":
-            # Post a standard final line too (harmless if our 15-min ticker already posted one)
-            final_line = f"🏁 Final: {cur['away_abbr']} {cur['away_score']} — {cur['home_abbr']} {cur['home_score']}"
-            if not await _already_sent(ch, final_line):
-                await ch.send(final_line)
-
-            # refresh snapshot to get latest pts_week
-            await refresh_snapshot()
-
-            abbrs = {cur["home_abbr"], cur["away_abbr"]}
-            contribs: List[Tuple[str, float]] = []
-            for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
-                pts = _fantasy_points_from_abbrs(t, abbrs)
-                if pts > 0:
-                    contribs.append((t.get("name", f"Team {tid}"), pts))
-
-            if contribs:
-                contribs.sort(key=lambda x: x[1], reverse=True)
-                top = contribs[:5]
-                parts = [f"{nm}: +{v:.1f}" for nm, v in top]
-                impact = " • ".join(parts)
-                impact_line = f"📊 Game Impact ({'/'.join(sorted(abbrs))}): {impact}"
-                if not await _already_sent(ch, impact_line):
-                    await ch.send(impact_line)
-
-        # save snapshot for next loop
-        STATE["score_state"][eid] = cur
-
-    if changed_any:
-        _save_state(STATE)
-
-@scores_watch.before_loop
-async def before_scores_watch():
-    await bot.wait_until_ready()
-
 def refresh_top_players() -> None:
     """Build Top-N players by projection from LEAGUE_SNAPSHOT."""
     try:
@@ -692,8 +554,6 @@ def _load_state() -> Dict[str, List[str]]:
             data = {"scores": [], "injuries": [], "meta": {}}
         data.setdefault("scores", [])
         data.setdefault("injuries", [])
-        data.setdefault("score_state", {})      # per-game last seen status (scores, period, clock)
-        data.setdefault("nfl_game_contrib", {}) # per-game fantasy points contributed by NFL teams
         # new: keep a meta bucket for timestamps, etc.
         meta = data.setdefault("meta", {})
         # ensure inj_last_run exists (ISO string or None)
@@ -721,56 +581,6 @@ def _state_add(kind: str, key: str, cap: int = 400) -> None:
         if len(arr) > cap:
             del arr[: len(arr) - cap]
         _save_state(STATE)
-
-# ---- Fantasy context helpers for live scoring ----
-def _fantasy_index_by_abbr() -> Dict[str, Dict[str, int]]:
-    """
-    Returns { 'DAL': {'TeamIdStr': count_of_players, ...}, ... }
-    based on current LEAGUE_SNAPSHOT players.
-    """
-    idx: Dict[str, Dict[str, int]] = {}
-    for tid, t in LEAGUE_SNAPSHOT.get("teams", {}).items():
-        for pid in t.get("players", []):
-            p = LEAGUE_SNAPSHOT["players"].get(pid)
-            if not p:
-                continue
-            abbr = _norm_abbr(p.get("team", "") or "")
-            if not abbr:
-                continue
-            bucket = idx.setdefault(abbr, {})
-            bucket[tid] = bucket.get(tid, 0) + 1
-    return idx
-
-def _fantasy_points_from_abbrs(team: dict, abbrs: set[str]) -> float:
-    total = 0.0
-    for pid in team.get("players", []):
-        p = LEAGUE_SNAPSHOT["players"].get(pid)
-        if not p:
-            continue
-        if _norm_abbr(p.get("team", "") or "") in abbrs:
-            # prefer week points if present
-            pts = p.get("pts_week", None)
-            try:
-                total += float(pts) if pts is not None else 0.0
-            except Exception:
-                pass
-    return total
-
-def _fun_quip(scoring_abbr: str, idx: Dict[str, Dict[str, int]]) -> str:
-    """
-    Make a playful, short quip listing managers/teams who roster that NFL team’s players.
-    """
-    bucket = idx.get(scoring_abbr, {})
-    if not bucket:
-        return ""
-    # sort teams by how many players they roster from the scoring NFL team
-    top = sorted(bucket.items(), key=lambda kv: kv[1], reverse=True)[:3]
-    pieces = []
-    for tid, count in top:
-        tm = LEAGUE_SNAPSHOT["teams"].get(tid, {})
-        pieces.append(f"{tm.get('name','Team')} ({count})")
-    return " — fantasy bump for: " + ", ".join(pieces)
-
 
 # ---------- Alerts fetch + post ----------
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
@@ -1757,9 +1567,6 @@ async def on_ready():
     if not poll_alerts.is_running():
         logger.info("Starting poll_alerts loop…")
         poll_alerts.start()
-    if not scores_watch.is_running():
-        logger.info("Starting scores_watch loop…")
-        scores_watch.start()
 
     # --- NEW: guarded boot steps so Render never hangs on slow ESPN/network
     try:
